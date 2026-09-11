@@ -27,6 +27,10 @@ data/*.db
 # Training dataset (not required to run the app)
 data/Industrial Surveillance Dataset/
 
+# OWLv2 weights (download with: python download_owlv2.py)
+models/owlv2/
+models--google--owlv2-base-patch16-ensemble/
+
 # OS
 Thumbs.db
 Desktop.ini

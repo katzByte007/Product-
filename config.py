@@ -37,7 +37,8 @@ DISPLAY_MAX_WIDTH = int(os.environ.get("VISION_DISPLAY_MAX_WIDTH", "960"))
 VIDEO_BUFFER_SIZE = 1
 VIDEO_READ_SLEEP = 0.001
 
-# Beta AI models
+# Beta AI models (weights are not in git — run: python download_owlv2.py)
+# Override local folder with VISION_OWLV2_LOCAL_PATH if the model lives elsewhere.
 OWLV2_MODEL_ID = os.environ.get("VISION_OWLV2_MODEL", "google/owlv2-base-patch16-ensemble")
 QWEN25VL_LOCAL_PATH = os.environ.get("VISION_QWEN25VL_LOCAL_PATH", "").strip()
 OWLV2_LOCAL_PATH = os.environ.get("VISION_OWLV2_LOCAL_PATH", "").strip()
@@ -213,8 +214,8 @@ def discover_owlv2_local_path() -> str:
         os.path.expanduser("~"), ".cache", "huggingface", "hub"
     )
     return _first_config_dir(
-        os.path.join(BASE_DIR, "models--google--owlv2-base-patch16-ensemble"),
         os.path.join(BASE_DIR, "models", "owlv2"),
+        os.path.join(BASE_DIR, "models--google--owlv2-base-patch16-ensemble"),
         os.path.join(BASE_DIR, "owlv2"),
         os.path.join(hf_home, "models--google--owlv2-base-patch16-ensemble"),
         os.path.join(BASE_DIR, "models", "models--google--owlv2-base-patch16-ensemble"),
