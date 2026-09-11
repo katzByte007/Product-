@@ -31,7 +31,3 @@ data/Industrial Surveillance Dataset/
 Thumbs.db
 Desktop.ini
 .DS_Store
-
-# GitHub rejects files over 100MB
-models/ANPRlib.pt
-models/bestpharmappepro.onnx
