@@ -1,0 +1,37 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+.venv/
+venv/
+env/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Node
+frontend/node_modules/
+node_modules/
+npm-debug.log*
+
+# Runtime / generated data
+data/alerts/
+data/*.db
+*.db
+.env
+.env.*
+
+# Training dataset (not required to run the app)
+data/Industrial Surveillance Dataset/
+
+# OS
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+# GitHub rejects files over 100MB
+models/ANPRlib.pt
+models/bestpharmappepro.onnx
