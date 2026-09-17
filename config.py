@@ -57,6 +57,8 @@ VLM_DEVICE = _default_vlm_device()
 
 # OWLv2 tuning — 0 FPS = run as fast as the device allows (GPU) / ~2 FPS on CPU
 OWLV2_INFER_FPS = float(os.environ.get("VISION_OWLV2_INFER_FPS", "0"))
+OWLV2_WORKERS = max(1, int(os.environ.get("VISION_OWLV2_WORKERS", "1")))
+OWLV2_SCHEDULER_FPS = max(1.0, float(os.environ.get("VISION_OWLV2_SCHEDULER_FPS", "10")))
 OWLV2_INFER_MAX_WIDTH = int(os.environ.get("VISION_OWLV2_INFER_MAX_WIDTH", "640"))
 OWLV2_NMS_IOU = float(os.environ.get("VISION_OWLV2_NMS_IOU", "0.42"))
 OWLV2_MAX_DETECTIONS = int(os.environ.get("VISION_OWLV2_MAX_DETECTIONS", "8"))

@@ -53,6 +53,7 @@ from backend.runtime import (
 )
 from backend.stream import get_stream_publisher, start_stream_publisher, stop_stream_publisher
 from backend.video_reader import VideoFileReader
+from backend.owlv2_scheduler import owlv2_scheduler_stats
 from config import BASE_DIR, DISPLAY_FPS, HOST, PORT, VIDEOS_DIR, VLM_DEVICE, log_paths, pick_listen_port, server_access_urls
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -916,6 +917,7 @@ def api_system_stats():
             "anpr_active": len(anpr_procs),
             "fr_active": len(fr_procs),
             "automode_active": len(automode_procs),
+            "owlv2_scheduler": owlv2_scheduler_stats(),
         }
     )
 
@@ -943,6 +945,7 @@ def api_health():
         "automode": len(automode_procs),
         "frontend_dist": os.path.isfile(os.path.join(BASE_DIR, "frontend", "dist", "index.html")),
         "vlm_device_pref": VLM_DEVICE,
+        "owlv2_scheduler": owlv2_scheduler_stats(),
     })
 
 

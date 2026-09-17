@@ -31,6 +31,8 @@ from scipy.optimize import linear_sum_assignment
 from ultralytics import YOLO
 
 from backend.db import get_db
+from backend.inference_protocol import InferenceRequest
+from backend.owlv2_scheduler import get_owlv2_scheduler
 from backend.runtime import (
     beta_procs,
     video_readers,
@@ -1094,7 +1096,13 @@ class InferenceEngine:
 
                 for i in range(0, len(pending), self.micro_batch):
                     mb = pending[i:i + self.micro_batch]
-                    frames = [x[1] for x in mb]
+                    requests = [InferenceRequest(
+                        request_id=f"{self.name}:{cid}:{now}",
+                        camera_id=cid,
+                        model_key=self.name,
+                        frame=frame,
+                    ) for cid, frame, _info in mb]
+                    frames = [request.frame for request in requests]
                     confs = [x[2]['conf'] for x in mb]
                     batch_conf = min(confs) if confs else 0.5
 
@@ -2561,7 +2569,7 @@ class BetaDetectionProcessor:
             self.stats['status'] = 'No labels'
             return
         self.running = True
-        self._thread = threading.Thread(target=self._run_loop, daemon=True)
+        self._thread = threading.Thread(target=self._prepare_scheduler, daemon=True)
         self._thread.start()
 
     def _all_labels(self):
@@ -2576,12 +2584,31 @@ class BetaDetectionProcessor:
 
     def stop(self):
         self.running = False
+        if getattr(self, '_scheduler', None) is not None:
+            self._scheduler.unregister(getattr(self, '_scheduler_key', self.camera_id))
         if self._thread is not None:
             self._thread.join(timeout=5.0)
             self._thread = None
 
-    def _run_loop(self):
+    def _prepare_scheduler(self):
         proc, model = _get_owlv2()
+        if proc is None or model is None:
+            self.stats['status'] = 'Model unavailable'
+            self.running = False
+            return
+        self._scheduler = get_owlv2_scheduler()
+        self._scheduler_key = f"legacy:{self.camera_id}"
+        self._scheduler.register(
+            self._scheduler_key,
+            self.camera_reader,
+            lambda frame: self._run_loop(frame, proc, model),
+            interval=self.BETA_FRAME_INTERVAL,
+        )
+        self.stats['status'] = 'Active'
+
+    def _run_loop(self, scheduled_frame=None, proc=None, model=None):
+        if proc is None or model is None:
+            proc, model = _get_owlv2()
         if proc is None or model is None:
             self.stats['status'] = 'Model unavailable'
             self.running = False
@@ -2599,7 +2626,7 @@ class BetaDetectionProcessor:
                 if now - last_t < self.BETA_FRAME_INTERVAL:
                     time.sleep(0.03)
                     continue
-                frame = self.camera_reader.get_frame()
+                frame = scheduled_frame if scheduled_frame is not None else self.camera_reader.get_frame()
                 if frame is None:
                     time.sleep(0.05)
                     continue
@@ -2661,9 +2688,13 @@ class BetaDetectionProcessor:
                         self.camera_id, 'beta_owlv2', vis, last_dets, severity='medium',
                         meta={'model': 'owlv2', 'detections': len(last_dets)}
                     )
+                if scheduled_frame is not None:
+                    return
             except Exception as e:
                 logger.error(f"Beta {self.camera_id}: {e}")
                 self.stats['status'] = str(e)[:40]
+                if scheduled_frame is not None:
+                    return
                 time.sleep(0.2)
 
     def get_annotated_frame(self):

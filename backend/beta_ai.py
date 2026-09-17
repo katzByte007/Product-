@@ -9,9 +9,13 @@ import time
 import cv2
 import numpy as np
 
+from backend.owlv2_scheduler import get_owlv2_scheduler
+
 from config import (
     OWLV2_INFER_FPS,
     OWLV2_INFER_MAX_WIDTH,
+    OWLV2_SCHEDULER_FPS,
+    OWLV2_WORKERS,
     OWLV2_LOCAL_PATH,
     OWLV2_MAX_DETECTIONS,
     OWLV2_MIN_BOX_AREA,
@@ -121,10 +125,61 @@ def _ensure_qwen_imports():
         _QWEN_IMPORT_ERROR = err
         return False
 
+class _FairInferenceLock:
+    """Serialize singleton-model calls without letting one camera monopolize it."""
+
+    def __init__(self):
+        self._condition = threading.Condition()
+        self._busy = False
+        self._waiters = []
+        self.wait_count = 0
+        self.completed_count = 0
+        self.total_wait_s = 0.0
+
+    def acquire(self):
+        token = object()
+        started = time.perf_counter()
+        with self._condition:
+            self._waiters.append(token)
+            self.wait_count += 1
+            while self._busy or self._waiters[0] is not token:
+                self._condition.wait()
+            self._waiters.pop(0)
+            self._busy = True
+            self.total_wait_s += time.perf_counter() - started
+        return True
+
+    def release(self):
+        with self._condition:
+            if not self._busy:
+                raise RuntimeError("OWLv2 inference lock released while idle")
+            self._busy = False
+            self.completed_count += 1
+            self._condition.notify_all()
+
+    def __enter__(self):
+        self.acquire()
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        self.release()
+
+    @property
+    def stats(self):
+        with self._condition:
+            average_wait = self.total_wait_s / self.wait_count if self.wait_count else 0.0
+            return {
+                "queued": len(self._waiters),
+                "wait_count": self.wait_count,
+                "completed": self.completed_count,
+                "average_wait_ms": round(average_wait * 1000.0, 1),
+            }
+
+
 _owlv2_processor = None
 _owlv2_model = None
 _owlv2_lock = threading.Lock()
-_owlv2_infer_lock = threading.Lock()
+_owlv2_infer_lock = _FairInferenceLock()
 
 _qwen_processor = None
 _qwen_model = None
@@ -646,6 +701,8 @@ class BetaOwlv2Processor:
         self._overlay_labels = []
         self._frame_size = (0, 0)
         self._annotated_frame = None
+        self._scheduler = None
+        self._scheduler_ready = threading.Event()
         self.stats = {"detections": 0, "status": "Initializing", "device": VLM_DEVICE}
 
     def _all_labels(self):
@@ -666,13 +723,91 @@ class BetaOwlv2Processor:
             self.stats["status"] = "No labels"
             return
         self.running = True
-        self._thread = threading.Thread(target=self._run_loop, daemon=True)
+        self._thread = threading.Thread(target=self._prepare_scheduler, daemon=True)
         self._thread.start()
 
     def stop(self):
         self.running = False
+        if self._scheduler is not None:
+            self._scheduler.unregister(getattr(self, "_scheduler_key", self.camera_id))
         if self._thread:
             self._thread.join(timeout=5.0)
+
+    def _prepare_scheduler(self):
+        proc, model = _get_owlv2()
+        if proc is None or model is None:
+            self.stats["status"] = "Model unavailable"
+            self.running = False
+            return
+        labels = self._all_labels()
+        device = next(model.parameters()).device if torch is not None else "cpu"
+        if not self.running:
+            return
+        self._scheduler = get_owlv2_scheduler(OWLV2_WORKERS)
+        self._scheduler_key = f"beta:{self.camera_id}"
+        self._scheduler.register(
+            self._scheduler_key,
+            self.camera_reader,
+            lambda frame: self._process_frame(frame, proc, model, labels, device),
+            interval=max(_infer_min_interval(device), 1.0 / OWLV2_SCHEDULER_FPS),
+        )
+        self.stats.update({"status": "Active", "device": str(device)})
+        self._scheduler_ready.set()
+        while self.running:
+            self._scheduler_ready.wait(1.0)
+
+    def _process_frame(self, frame, proc, model, labels, device):
+        if not self.running:
+            return
+        text_labels = [labels]
+        h, w = frame.shape[:2]
+        infer_frame = frame
+        if w > self.INFER_MAX_WIDTH:
+            scale = self.INFER_MAX_WIDTH / float(w)
+            infer_frame = cv2.resize(
+                frame,
+                (self.INFER_MAX_WIDTH, max(1, int(round(h * scale)))),
+                interpolation=cv2.INTER_AREA,
+            )
+        ih, iw = infer_frame.shape[:2]
+        pil_image = Image.fromarray(cv2.cvtColor(infer_frame, cv2.COLOR_BGR2RGB))
+        inputs = proc(text=text_labels, images=pil_image, return_tensors="pt")
+        if torch is not None:
+            inputs = {k: v.to(device) if hasattr(v, "to") else v for k, v in inputs.items()}
+        with _owlv2_infer_lock:
+            if torch is not None:
+                with torch.inference_mode():
+                    outputs = model(**inputs)
+            else:
+                outputs = model(**inputs)
+        raw_dets = _owlv2_decode_boxes(
+            proc, outputs, inputs, ih, iw, max(0.01, self.conf), text_labels
+        )
+        sx, sy = w / float(iw), h / float(ih)
+        mapped = []
+        for det in raw_dets:
+            x1, y1, x2, y2 = det["box"]
+            mapped.append({
+                "box": (int(round(x1 * sx)), int(round(y1 * sy)), int(round(x2 * sx)), int(round(y2 * sy))),
+                "score": det["score"],
+                "label": det["label"],
+            })
+        min_area = max(120, int(OWLV2_MIN_BOX_AREA * (w * h) / (1920 * 1080) * 0.35))
+        kept = _filter_detections_norm(mapped, self.conf, w, h, min_area=min_area)
+        vis = frame.copy()
+        for det in kept:
+            x1, y1, x2, y2 = det["box"]
+            _draw_box(vis, x1, y1, x2, y2, f"{det['label']} {det['score']:.2f}")
+        if not self._decorate_frame(vis, kept, labels):
+            dev_short = "GPU" if _device_is_gpu(device) else "CPU"
+            _draw_hud(vis, f"Beta (OWLv2/{dev_short})  |  Detections: {len(kept)}", f"Labels: {', '.join(labels[:6])}{'...' if len(labels) > 6 else ''}")
+        self._on_detections(frame, vis, kept, labels)
+        with self.lock:
+            self._overlay_dets = kept
+            self._overlay_labels = labels
+            self._frame_size = (w, h)
+            self._annotated_frame = vis
+        self.stats = {"detections": len(kept), "status": "Active", "device": str(device), "scheduler": self._scheduler.stats}
 
     def _run_loop(self):
         proc, model = _get_owlv2()
