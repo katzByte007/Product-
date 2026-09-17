@@ -147,18 +147,39 @@ class IntrusionDetectionProcessor:
             return
         self.running = True
         self._prime_overlay()
-        self._thread = threading.Thread(target=self._run_loop, daemon=True, name=f"Intrusion-{self.camera_id}")
+        self._thread = threading.Thread(target=self._prepare_scheduler, daemon=True, name=f"Intrusion-{self.camera_id}")
         self._thread.start()
 
     def stop(self):
         self.running = False
+        if getattr(self, "_scheduler", None) is not None:
+            self._scheduler.unregister(getattr(self, "_scheduler_key", self.camera_id))
         if self._thread:
             self._thread.join(timeout=5.0)
 
-    def _run_loop(self):
+    def _prepare_scheduler(self):
         from PIL import Image
 
         proc, model = beta_ai._get_owlv2()
+        if proc is None or model is None:
+            self.stats["status"] = "OWLv2 unavailable"
+            return
+        from backend.owlv2_scheduler import get_owlv2_scheduler
+        self._scheduler = get_owlv2_scheduler()
+        self._scheduler_key = f"intrusion:{self.camera_id}"
+        self._scheduler.register(
+            self._scheduler_key,
+            self.camera_reader,
+            lambda frame: self._run_loop(frame, proc, model),
+            interval=max(beta_ai._infer_min_interval(next(model.parameters()).device), 0.1),
+        )
+        self.stats["status"] = "Active"
+
+    def _run_loop(self, scheduled_frame=None, proc=None, model=None):
+        from PIL import Image
+
+        if proc is None or model is None:
+            proc, model = beta_ai._get_owlv2()
         if proc is None or model is None:
             self.stats["status"] = "OWLv2 unavailable"
             return
@@ -178,7 +199,7 @@ class IntrusionDetectionProcessor:
                     continue
                 last_t = now
 
-                frame = self.camera_reader.get_frame()
+                frame = scheduled_frame if scheduled_frame is not None else self.camera_reader.get_frame()
                 if frame is None:
                     time.sleep(0.05)
                     continue
@@ -314,9 +335,13 @@ class IntrusionDetectionProcessor:
                     self._last_detections = last_dets
 
                 self.stats = {"detections": len(mapped), "status": "Active", "alert": alert_now}
+                if scheduled_frame is not None:
+                    return
 
             except Exception as e:
                 logger.error("Intrusion %s: %s", self.camera_id, e)
+                if scheduled_frame is not None:
+                    return
                 time.sleep(0.2)
 
     def _draw_zones(self, frame):
