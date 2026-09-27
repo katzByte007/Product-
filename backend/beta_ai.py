@@ -20,7 +20,18 @@ from config import (
     OWLV2_MAX_DETECTIONS,
     OWLV2_MIN_BOX_AREA,
     OWLV2_MODEL_ID,
+    OWLV2_MOTION_GATE_ENABLED,
+    OWLV2_MOTION_THRESHOLD,
+    OWLV2_HEARTBEAT_SEC,
+    OWLV2_TRACKER_ROI_PAD,
     OWLV2_NMS_IOU,
+    OWLV2_USE_FP16,
+    OWLV2_USE_BF16,
+    OWLV2_USE_AUTOCast,
+    OWLV2_QUANT_MODE,
+    OWLV2_TENSORRT_ENABLED,
+    OWLV2_STATIC_SHAPE,
+    OWLV2_MAX_BATCH,
     QWEN25VL_LOCAL_PATH,
     TORCH_THREADS,
     VLM_DEVICE,
@@ -65,6 +76,110 @@ def _ensure_pil():
 
 _OWLV2_IMPORT_ERROR = ""
 _QWEN_IMPORT_ERROR = ""
+_OWLV2_TEXT_CACHE = {}
+
+
+def _build_cached_text_key(labels):
+    """Canonicalize labels so repeated prompt sets reuse the same text-token path."""
+    normalized = []
+    seen = set()
+    for label in labels or []:
+        clean = str(label).strip()
+        if not clean:
+            continue
+        key = clean.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        normalized.append(key)
+    return tuple(normalized)
+
+
+def _motion_score(prev_frame, curr_frame):
+    """Return a normalized motion score in the range [0, 1]. Values near zero mean static scene."""
+    if prev_frame is None or curr_frame is None:
+        return 1.0
+    if prev_frame.shape[:2] != curr_frame.shape[:2]:
+        prev_frame = cv2.resize(prev_frame, (curr_frame.shape[1], curr_frame.shape[0]), interpolation=cv2.INTER_AREA)
+    if len(prev_frame.shape) == 3:
+        prev_gray = cv2.cvtColor(prev_frame, cv2.COLOR_BGR2GRAY)
+    else:
+        prev_gray = prev_frame
+    if len(curr_frame.shape) == 3:
+        curr_gray = cv2.cvtColor(curr_frame, cv2.COLOR_BGR2GRAY)
+    else:
+        curr_gray = curr_frame
+    diff = cv2.absdiff(prev_gray, curr_gray)
+    return float(np.mean(diff) / 255.0)
+
+
+def _motion_roi(prev_frame, curr_frame, threshold=0.012, pad=32):
+    """Return a padded rectangle around the changed pixels, or None when motion is negligible."""
+    if prev_frame is None or curr_frame is None:
+        return None
+    if prev_frame.shape[:2] != curr_frame.shape[:2]:
+        prev_frame = cv2.resize(prev_frame, (curr_frame.shape[1], curr_frame.shape[0]), interpolation=cv2.INTER_AREA)
+    if len(prev_frame.shape) == 3:
+        prev_gray = cv2.cvtColor(prev_frame, cv2.COLOR_BGR2GRAY)
+    else:
+        prev_gray = prev_frame
+    if len(curr_frame.shape) == 3:
+        curr_gray = cv2.cvtColor(curr_frame, cv2.COLOR_BGR2GRAY)
+    else:
+        curr_gray = curr_frame
+    diff = cv2.absdiff(prev_gray, curr_gray)
+    if float(np.mean(diff) / 255.0) <= threshold:
+        return None
+    _, mask = cv2.threshold(diff, max(10, int(threshold * 255.0)), 255, cv2.THRESH_BINARY)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
+    mask = cv2.morphologyEx(mask, cv2.MORPH_DILATE, np.ones((5, 5), np.uint8))
+    ys, xs = np.where(mask > 0)
+    if xs.size == 0 or ys.size == 0:
+        return None
+    x1, x2 = int(xs.min()), int(xs.max()) + 1
+    y1, y2 = int(ys.min()), int(ys.max()) + 1
+    h, w = curr_frame.shape[:2]
+    pad_x = max(0, int(pad))
+    pad_y = max(0, int(pad))
+    x1 = max(0, x1 - pad_x)
+    x2 = min(w, x2 + pad_x)
+    y1 = max(0, y1 - pad_y)
+    y2 = min(h, y2 + pad_y)
+    if x2 <= x1 or y2 <= y1:
+        return None
+    return (x1, y1, x2, y2)
+
+
+def should_run_owlv2(prev_frame, curr_frame, threshold=None, heartbeat_sec=None, last_trigger_time=None, now=None):
+    """Motion-gate OWLv2 to skip static scenes and only heartbeat every few seconds."""
+    if prev_frame is None or curr_frame is None:
+        return True
+    threshold = threshold if threshold is not None else 0.012
+    score = _motion_score(prev_frame, curr_frame)
+    if score > threshold:
+        return True
+    if heartbeat_sec is not None and last_trigger_time is not None and now is not None:
+        return (now - last_trigger_time) >= heartbeat_sec
+    return False
+
+
+def _get_cached_text_labels(labels):
+    key = _build_cached_text_key(labels)
+    if key in _OWLV2_TEXT_CACHE:
+        return list(_OWLV2_TEXT_CACHE[key])
+    text = []
+    seen = set()
+    for label in labels or []:
+        clean = str(label).strip()
+        if not clean:
+            continue
+        norm = clean.lower()
+        if norm in seen:
+            continue
+        seen.add(norm)
+        text.append(norm)
+    _OWLV2_TEXT_CACHE[key] = tuple(text)
+    return list(text)
 
 
 def _ensure_owlv2_imports():
@@ -196,6 +311,24 @@ def _device():
     if pref == "mps" and torch is not None and getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
         return "mps"
     return "cpu"
+
+
+def _owlv2_precision_dtype(device):
+    """Return a safe runtime dtype for smaller-GPU OWLv2 execution."""
+    if torch is None or device == "cpu":
+        return None
+    mode = (OWLV2_QUANT_MODE or "fp16").strip().lower()
+    if device == "cuda":
+        if mode == "bf16" and hasattr(torch, "bfloat16"):
+            return torch.bfloat16
+        if mode in ("fp8", "int8", "w8a16"):
+            logger.info("OWLv2 quantization mode '%s' requested; using FP16-safe fallback for compatibility.", mode)
+            return torch.float16 if OWLV2_USE_FP16 else torch.float32
+        if OWLV2_USE_BF16 and hasattr(torch, "bfloat16"):
+            return torch.bfloat16
+        if OWLV2_USE_FP16:
+            return torch.float16
+    return torch.float32
 
 
 def _device_is_gpu(device) -> bool:
@@ -371,10 +504,14 @@ def _get_owlv2():
         if _owlv2_processor is None:
             try:
                 local = _owlv2_local_dir()
+                dtype = _owlv2_precision_dtype(dev)
+                _load_kwargs = {}
+                if torch is not None and dev == "cuda" and dtype is not None:
+                    _load_kwargs["torch_dtype"] = dtype
                 if local:
                     logger.info("Loading OWLv2 from local weights: %s", local)
                     _owlv2_processor = Owlv2Processor.from_pretrained(local, local_files_only=True)
-                    _owlv2_model = Owlv2ForObjectDetection.from_pretrained(local, local_files_only=True)
+                    _owlv2_model = Owlv2ForObjectDetection.from_pretrained(local, local_files_only=True, **_load_kwargs)
                 else:
                     if OWLV2_LOCAL_PATH and not _has_model_weights(OWLV2_LOCAL_PATH):
                         logger.warning(
@@ -383,19 +520,27 @@ def _get_owlv2():
                         )
                     logger.info("Loading OWLv2 from HuggingFace: %s", OWLV2_MODEL_ID)
                     _owlv2_processor = Owlv2Processor.from_pretrained(OWLV2_MODEL_ID)
-                    _owlv2_model = Owlv2ForObjectDetection.from_pretrained(OWLV2_MODEL_ID)
+                    _owlv2_model = Owlv2ForObjectDetection.from_pretrained(OWLV2_MODEL_ID, **_load_kwargs)
                 if torch is not None:
                     _owlv2_model = _owlv2_model.to(dev)
-                    if dev == "cuda":
+                    if dev == "cuda" and OWLV2_STATIC_SHAPE:
                         try:
-                            _owlv2_model = _owlv2_model.half()
+                            _owlv2_model.config.use_cache = False
+                        except Exception:
+                            pass
+                    if dev == "cuda" and (OWLV2_USE_FP16 or OWLV2_USE_BF16):
+                        try:
+                            if OWLV2_USE_BF16 and hasattr(torch, "bfloat16"):
+                                _owlv2_model = _owlv2_model.to(torch.bfloat16)
+                            else:
+                                _owlv2_model = _owlv2_model.half()
                         except Exception:
                             pass
                     try:
                         gpu_name = torch.cuda.get_device_name(0) if dev == "cuda" else dev
                     except Exception:
                         gpu_name = dev
-                    logger.info("OWLv2 loaded on %s (%s)", dev, gpu_name)
+                    logger.info("OWLv2 loaded on %s (%s) | fp16=%s bf16=%s autocast=%s static_shape=%s batch=%s", dev, gpu_name, OWLV2_USE_FP16, OWLV2_USE_BF16, OWLV2_USE_AUTOCast, OWLV2_STATIC_SHAPE, OWLV2_MAX_BATCH)
                 _owlv2_model.eval()
             except Exception as e:
                 logger.error("OWLv2 load failed: %s", e, exc_info=True)
@@ -703,6 +848,9 @@ class BetaOwlv2Processor:
         self._annotated_frame = None
         self._scheduler = None
         self._scheduler_ready = threading.Event()
+        self._last_frame = None
+        self._last_trigger_at = 0.0
+        self._motion_state_lock = threading.Lock()
         self.stats = {"detections": 0, "status": "Initializing", "device": VLM_DEVICE}
 
     def _all_labels(self):
@@ -749,24 +897,76 @@ class BetaOwlv2Processor:
             self._scheduler_key,
             self.camera_reader,
             lambda frame: self._process_frame(frame, proc, model, labels, device),
-            interval=max(_infer_min_interval(device), 1.0 / OWLV2_SCHEDULER_FPS),
+            interval=getattr(
+                self,
+                "scheduler_interval",
+                max(_infer_min_interval(device), 1.0 / OWLV2_SCHEDULER_FPS),
+            ),
         )
         self.stats.update({"status": "Active", "device": str(device)})
         self._scheduler_ready.set()
         while self.running:
             self._scheduler_ready.wait(1.0)
 
+    def _should_infer(self, frame):
+        with self._motion_state_lock:
+            if not OWLV2_MOTION_GATE_ENABLED:
+                self._last_frame = frame.copy() if frame is not None else None
+                self._last_trigger_at = time.monotonic()
+                return True, None
+            if frame is None:
+                return True, None
+            previous_frame = self._last_frame
+            if previous_frame is None:
+                self._last_frame = frame.copy()
+                self._last_trigger_at = time.monotonic()
+                return True, None
+            now = time.monotonic()
+            score = _motion_score(previous_frame, frame)
+            moved = score > OWLV2_MOTION_THRESHOLD
+            heartbeat = (now - self._last_trigger_at) >= OWLV2_HEARTBEAT_SEC
+            should_infer = moved or heartbeat
+            roi = (
+                _motion_roi(
+                    previous_frame,
+                    frame,
+                    threshold=OWLV2_MOTION_THRESHOLD,
+                    pad=OWLV2_TRACKER_ROI_PAD,
+                )
+                if moved
+                else None
+            )
+            self._last_frame = frame.copy()
+            if should_infer:
+                self._last_trigger_at = now
+            return should_infer, roi
+
     def _process_frame(self, frame, proc, model, labels, device):
         if not self.running:
             return
+        should_infer, roi = self._should_infer(frame)
+        if not should_infer:
+            self.stats = {"detections": self.stats.get("detections", 0), "status": "Idle (static scene)", "device": str(device), "scheduler": getattr(self._scheduler, "stats", None) if self._scheduler else None}
+            return
+        labels = _get_cached_text_labels(labels)
         text_labels = [labels]
         h, w = frame.shape[:2]
         infer_frame = frame
-        if w > self.INFER_MAX_WIDTH:
-            scale = self.INFER_MAX_WIDTH / float(w)
+        offset_x = 0
+        offset_y = 0
+        if roi is not None:
+            x1, y1, x2, y2 = roi
+            offset_x, offset_y = x1, y1
+            infer_frame = frame[y1:y2, x1:x2]
+            if infer_frame.size == 0:
+                infer_frame = frame
+                offset_x = 0
+                offset_y = 0
+        if infer_frame.shape[1] > self.INFER_MAX_WIDTH:
+            scale = self.INFER_MAX_WIDTH / float(infer_frame.shape[1])
             infer_frame = cv2.resize(
-                frame,
-                (self.INFER_MAX_WIDTH, max(1, int(round(h * scale)))),
+                infer_frame,
+                (self.INFER_MAX_WIDTH, max(1, int(round(infer_frame.shape[0] * scale)))),
                 interpolation=cv2.INTER_AREA,
             )
         ih, iw = infer_frame.shape[:2]
@@ -777,18 +977,31 @@ class BetaOwlv2Processor:
         with _owlv2_infer_lock:
             if torch is not None:
                 with torch.inference_mode():
-                    outputs = model(**inputs)
+                    if OWLV2_USE_AUTOCast and device == "cuda":
+                        dtype = torch.float16 if OWLV2_USE_FP16 else (torch.bfloat16 if OWLV2_USE_BF16 and hasattr(torch, "bfloat16") else None)
+                        if dtype is not None:
+                            with torch.autocast(device_type="cuda", dtype=dtype):
+                                outputs = model(**inputs)
+                        else:
+                            outputs = model(**inputs)
+                    else:
+                        outputs = model(**inputs)
             else:
                 outputs = model(**inputs)
         raw_dets = _owlv2_decode_boxes(
             proc, outputs, inputs, ih, iw, max(0.01, self.conf), text_labels
         )
-        sx, sy = w / float(iw), h / float(ih)
+        sx = (w / float(iw)) if offset_x == 0 and offset_y == 0 else (max(1.0, (roi[2] - roi[0]) / float(iw)))
+        sy = (h / float(ih)) if offset_x == 0 and offset_y == 0 else (max(1.0, (roi[3] - roi[1]) / float(ih)))
         mapped = []
         for det in raw_dets:
             x1, y1, x2, y2 = det["box"]
+            px1 = int(round(x1 * sx)) + offset_x
+            py1 = int(round(y1 * sy)) + offset_y
+            px2 = int(round(x2 * sx)) + offset_x
+            py2 = int(round(y2 * sy)) + offset_y
             mapped.append({
-                "box": (int(round(x1 * sx)), int(round(y1 * sy)), int(round(x2 * sx)), int(round(y2 * sy))),
+                "box": (px1, py1, px2, py2),
                 "score": det["score"],
                 "label": det["label"],
             })
@@ -859,8 +1072,12 @@ class BetaOwlv2Processor:
                 with _owlv2_infer_lock:
                     if torch is not None:
                         with torch.inference_mode():
-                            if _device_is_gpu(device):
-                                with torch.autocast(device_type="cuda", dtype=torch.float16):
+                            if _device_is_gpu(device) and OWLV2_USE_AUTOCast:
+                                dtype = torch.float16 if OWLV2_USE_FP16 else (torch.bfloat16 if OWLV2_USE_BF16 and hasattr(torch, "bfloat16") else None)
+                                if dtype is not None:
+                                    with torch.autocast(device_type="cuda", dtype=dtype):
+                                        outputs = model(**inputs)
+                                else:
                                     outputs = model(**inputs)
                             else:
                                 outputs = model(**inputs)

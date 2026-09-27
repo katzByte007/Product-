@@ -15,9 +15,11 @@ export default function AutoModePanel({ open, onClose }) {
   const [cameraIds, setCameraIds] = useState([]);
   const [enabled, setEnabled] = useState(false);
   const [confidence, setConfidence] = useState(0.2);
+  const [model, setModel] = useState('owlv2');
   const [cameras, setCameras] = useState([]);
   const [activeCameras, setActiveCameras] = useState([]);
   const [owlAvailable, setOwlAvailable] = useState(true);
+  const [yoloWorldAvailable, setYoloWorldAvailable] = useState(false);
   const [status, setStatus] = useState('');
   const [loading, setLoading] = useState(false);
   const [scheduleEnabled, setScheduleEnabled] = useState(false);
@@ -31,8 +33,10 @@ export default function AutoModePanel({ open, onClose }) {
       setCameraIds(cfg.camera_ids || []);
       setEnabled(Boolean(cfg.enabled));
       setConfidence(cfg.confidence ?? 0.2);
+      setModel(cfg.model || 'owlv2');
       setActiveCameras(cfg.active_cameras || []);
       setOwlAvailable(cfg.owlv2_available !== false);
+      setYoloWorldAvailable(Boolean(cfg.yolo_world_available));
       setScheduleEnabled(Boolean(cfg.schedule_enabled));
       setScheduleStart(cfg.schedule_start || '08:00');
       setScheduleEnd(cfg.schedule_end || '18:00');
@@ -59,18 +63,21 @@ export default function AutoModePanel({ open, onClose }) {
         prompt,
         camera_ids: cameraIds,
         confidence,
+        model,
         schedule_enabled: scheduleEnabled,
         schedule_start: scheduleStart,
         schedule_end: scheduleEnd,
       });
       setActiveCameras(res.active_cameras || []);
+      if (res.model) setModel(res.model);
       if (res.prompt) setPrompt(res.prompt);
       if (res.scheduled_idle) {
         setStatus('Saved. Autotrack will start during the scheduled hours.');
       } else if (res.errors?.length) {
         setStatus(`Started on ${(res.active_cameras || []).length} camera(s). Issues: ${res.errors.join('; ')}`);
       } else if (enabled) {
-        setStatus(`Autotrack (OWLv2) watching ${(res.active_cameras || []).length} camera(s) for: ${res.prompt || prompt}. Alerts appear after continuous detections.`);
+        const modelName = model === 'yolo-world' ? 'YOLO-World' : 'OWLv2';
+        setStatus(`Autotrack (${modelName}) watching ${(res.active_cameras || []).length} camera(s) for: ${res.prompt || prompt}. Alerts appear after continuous detections.`);
       } else {
         setStatus('Autotrack disabled.');
       }
@@ -82,6 +89,8 @@ export default function AutoModePanel({ open, onClose }) {
   };
 
   if (!open) return null;
+  const modelAvailable = model === 'yolo-world' ? yoloWorldAvailable : owlAvailable;
+  const modelName = model === 'yolo-world' ? 'YOLO-World' : 'OWLv2';
 
   return (
     <div className="automode-overlay" role="dialog" aria-modal="true" aria-label="Autotrack">
@@ -90,14 +99,25 @@ export default function AutoModePanel({ open, onClose }) {
         <div className="automode-header">
           <div>
             <h2 className="gradient-text">Autotrack</h2>
-            <p className="muted">OWLv2 — type objects to detect, pick cameras. Continuous hits on those cameras raise a cross-camera alert.</p>
+            <p className="muted">Select one prompt detector, then choose the cameras to monitor.</p>
           </div>
           <button type="button" className="link-btn automode-close" onClick={onClose}>Close</button>
         </div>
 
-        {!owlAvailable && (
-          <div className="demo-banner">OWLv2 model not loaded. Check the owlv2 weights folder and restart.</div>
+        {!modelAvailable && (
+          <div className="demo-banner">{modelName} is unavailable. Check its runtime dependencies and model weights.</div>
         )}
+
+        <label className="field-label" htmlFor="autotrack-model">Autotrack model</label>
+        <select
+          id="autotrack-model"
+          className="automode-prompt"
+          value={model}
+          onChange={(e) => setModel(e.target.value)}
+        >
+          <option value="owlv2">OWLv2</option>
+          <option value="yolo-world">YOLO-World</option>
+        </select>
 
         <label className="automode-toggle-row">
           <span>Enable Autotrack</span>
@@ -165,7 +185,7 @@ export default function AutoModePanel({ open, onClose }) {
         {status && <p className={`apply-status ${status.toLowerCase().includes('fail') || status.toLowerCase().includes('error') || status.startsWith('HTTP') ? 'err' : ''}`}>{status}</p>}
 
         <div className="automode-actions">
-          <button type="button" className="btn" disabled={loading} onClick={handleApply}>
+          <button type="button" className="btn" disabled={loading || (enabled && !modelAvailable)} onClick={handleApply}>
             {loading ? 'Applying…' : enabled ? 'Apply & Start Autotrack' : 'Save & Disable'}
           </button>
         </div>

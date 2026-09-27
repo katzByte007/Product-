@@ -27,7 +27,13 @@ from backend.db import ensure_demo_user, get_db, init_db, seed_default_cameras
 from backend.paths import migrate_camera_video_paths, resolve_video_path
 from backend.detection_routes import register_detection_routes
 from backend.alerts import delete_alert, delete_all_alerts
-from backend.automode import apply_automode, get_automode_config, restore_automode_from_db
+from backend.automode import (
+    AUTOTRACK_MODELS,
+    apply_automode,
+    get_automode_config,
+    restore_automode_from_db,
+    yolo_world_available,
+)
 from backend.dashboard import dashboard_payload
 from backend.mailer import (
     friendly_smtp_error,
@@ -711,6 +717,7 @@ def api_automode_get():
     cfg = get_automode_config()
     cfg["active_cameras"] = list(automode_procs.keys())
     cfg["owlv2_available"] = beta_ai.owlv2_available()
+    cfg["yolo_world_available"] = yolo_world_available()
     return jsonify(cfg)
 
 
@@ -725,11 +732,14 @@ def api_automode_save():
         if not isinstance(camera_ids, list):
             camera_ids = []
         confidence = float(data.get("confidence", 0.2))
+        model = str(data.get("model") or "owlv2").strip().lower()
+        if model not in AUTOTRACK_MODELS:
+            return jsonify({"error": f"model must be one of: {', '.join(AUTOTRACK_MODELS)}"}), 400
         schedule_enabled = bool(data.get("schedule_enabled"))
         schedule_start = str(data.get("schedule_start") or "")
         schedule_end = str(data.get("schedule_end") or "")
         result = apply_automode(
-            enabled, prompt, camera_ids, confidence, schedule_enabled, schedule_start, schedule_end
+            enabled, prompt, camera_ids, confidence, schedule_enabled, schedule_start, schedule_end, model
         )
         result["prompt"] = prompt
         result["camera_ids"] = camera_ids
@@ -737,6 +747,7 @@ def api_automode_save():
         result["schedule_enabled"] = schedule_enabled
         result["schedule_start"] = schedule_start
         result["schedule_end"] = schedule_end
+        result["model"] = model
         return jsonify(result)
     except Exception as e:
         logger.exception("Autotrack apply failed")
@@ -864,6 +875,10 @@ def api_assigned_engineers():
     return jsonify({"assignments": assignments})
 
 
+def _camera_health_snapshot():
+    return {camera_id: reader.health for camera_id, reader in video_readers.items()}
+
+
 @app.route("/api/plant-map")
 @login_required
 def api_plant_map():
@@ -881,6 +896,8 @@ def api_plant_map():
     cameras = []
     for i, r in enumerate(rows):
         lat, lng = coords[i % len(coords)]
+        reader = video_readers.get(r["camera_id"])
+        health = reader.health if reader else {"status": "not_connected", "healthy": False, "frame_age_sec": None}
         cameras.append(
             {
                 "camera_id": r["camera_id"],
@@ -889,7 +906,8 @@ def api_plant_map():
                 "longitude": r["longitude"] or lng,
                 "location_label": r["location_label"] or f"Zone {i+1}",
                 "status": r["status"],
-                "health": "healthy",
+                "health": "healthy" if health["healthy"] else health["status"],
+                "frame_age_sec": health["frame_age_sec"],
                 "alert_count": 0,
             }
         )
@@ -901,11 +919,14 @@ def api_plant_map():
 def api_system_stats():
     import psutil
 
+    camera_health = _camera_health_snapshot()
     return jsonify(
         {
             "cpu_percent": psutil.cpu_percent(interval=0.1),
             "memory_percent": psutil.virtual_memory().percent,
             "cameras_active": len(video_readers),
+            "cameras_healthy": sum(1 for item in camera_health.values() if item["healthy"]),
+            "cameras_unhealthy": sum(1 for item in camera_health.values() if not item["healthy"]),
             "beta_active": len(beta_procs),
             "headcount_active": len(headcount_procs),
             "entryexit_active": len(entryexit_procs),
@@ -927,11 +948,15 @@ BUILD_ID = "2026-08-31-vision-ai-brand-v1"
 
 @app.route("/api/health")
 def api_health():
+    camera_health = _camera_health_snapshot()
     return jsonify({
         "status": "ok",
         "app": "vision-ai",
         "build": BUILD_ID,
         "cameras": len(video_readers),
+        "cameras_healthy": sum(1 for item in camera_health.values() if item["healthy"]),
+        "cameras_unhealthy": sum(1 for item in camera_health.values() if not item["healthy"]),
+        "camera_health": camera_health,
         "beta": len(beta_procs),
         "headcount": len(headcount_procs),
         "entryexit": len(entryexit_procs),

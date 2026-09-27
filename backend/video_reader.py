@@ -5,7 +5,7 @@ import time
 
 import cv2
 
-from config import VIDEO_BUFFER_SIZE, VIDEO_READ_SLEEP
+from config import CAMERA_FRAME_STALE_SEC, VIDEO_BUFFER_SIZE, VIDEO_READ_SLEEP
 
 logger = logging.getLogger(__name__)
 
@@ -28,6 +28,7 @@ class VideoFileReader:
         self.frame = None
         self.frame_ts = 0.0
         self.running = False
+        self._stop_event = threading.Event()
         self.lock = threading.Lock()
         self.status = "initializing"
         self._thread = None
@@ -38,6 +39,7 @@ class VideoFileReader:
     def start(self):
         if self.running:
             return
+        self._stop_event.clear()
         self.running = True
         self._thread = threading.Thread(
             target=self._read_loop,
@@ -57,7 +59,17 @@ class VideoFileReader:
     def _open_capture(self):
         cap = cv2.VideoCapture()
         self._disable_auto_orientation(cap)
-        cap.open(self.video_path)
+        if self.video_path.lower().startswith(("rtsp://", "rtsps://")):
+            timeout_ms = 5000
+            params = [
+                cv2.CAP_PROP_OPEN_TIMEOUT_MSEC,
+                timeout_ms,
+                cv2.CAP_PROP_READ_TIMEOUT_MSEC,
+                timeout_ms,
+            ]
+            cap.open(self.video_path, cv2.CAP_FFMPEG, params)
+        else:
+            cap.open(self.video_path)
         self._disable_auto_orientation(cap)
         cap.set(cv2.CAP_PROP_BUFFERSIZE, VIDEO_BUFFER_SIZE)
         fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
@@ -72,15 +84,25 @@ class VideoFileReader:
 
     def _read_loop(self):
         cap = None
+        reconnect_delay = 1.0
+        is_live_source = self.video_path.lower().startswith(("rtsp://", "rtsps://"))
         while self.running:
             if cap is None or not cap.isOpened():
                 if cap is not None:
                     cap.release()
-                cap = self._open_capture()
-                if not cap.isOpened():
-                    self.status = "error"
+                try:
+                    cap = self._open_capture()
+                except Exception:
+                    cap = None
+                    logger.exception("Camera %s: capture open failed", self.camera_id)
+                if cap is None or not cap.isOpened():
+                    self.status = "reconnecting" if is_live_source else "error"
                     logger.error("Camera %s: cannot open %s", self.camera_id, self.video_path)
-                    time.sleep(2.0)
+                    if cap is not None:
+                        cap.release()
+                    cap = None
+                    self._stop_event.wait(reconnect_delay if is_live_source else 2.0)
+                    reconnect_delay = min(reconnect_delay * 2.0, 30.0)
                     continue
                 self.status = "active"
                 logger.info(
@@ -91,12 +113,26 @@ class VideoFileReader:
                 )
 
             t0 = time.perf_counter()
-            ret, frame = cap.read()
+            try:
+                ret, frame = cap.read()
+            except Exception:
+                logger.exception("Camera %s: capture read failed", self.camera_id)
+                ret, frame = False, None
             if not ret or frame is None:
-                cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-                self.loop_generation += 1
+                if is_live_source:
+                    logger.warning("Camera %s: RTSP read failed; reconnecting", self.camera_id)
+                    cap.release()
+                    cap = None
+                    self.status = "reconnecting"
+                    self._stop_event.wait(reconnect_delay)
+                    reconnect_delay = min(reconnect_delay * 2.0, 30.0)
+                else:
+                    cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                    self.loop_generation += 1
+                    time.sleep(max(VIDEO_READ_SLEEP, 0.01))
                 continue
 
+            reconnect_delay = 1.0
             frame = self._apply_rotation(frame)
             with self.lock:
                 self.frame = frame
@@ -112,9 +148,26 @@ class VideoFileReader:
 
     def get_frame(self):
         with self.lock:
-            return self.frame.copy() if self.frame is not None else None
+            if self.frame is None or self.status != "active":
+                return None
+            if time.time() - self.frame_ts > CAMERA_FRAME_STALE_SEC:
+                return None
+            return self.frame.copy()
+
+    @property
+    def health(self):
+        with self.lock:
+            frame_ts = self.frame_ts
+        age_sec = max(0.0, time.time() - frame_ts) if frame_ts else None
+        fresh = age_sec is not None and age_sec <= CAMERA_FRAME_STALE_SEC
+        return {
+            "status": self.status if fresh or self.status != "active" else "stale",
+            "healthy": self.status == "active" and fresh,
+            "frame_age_sec": round(age_sec, 3) if age_sec is not None else None,
+        }
 
     def stop(self):
         self.running = False
+        self._stop_event.set()
         if self._thread and self._thread.is_alive():
             self._thread.join(timeout=5.0)

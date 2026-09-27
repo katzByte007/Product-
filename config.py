@@ -36,10 +36,14 @@ DISPLAY_MAX_WIDTH = int(os.environ.get("VISION_DISPLAY_MAX_WIDTH", "960"))
 # Video file reader
 VIDEO_BUFFER_SIZE = 1
 VIDEO_READ_SLEEP = 0.001
+CAMERA_FRAME_STALE_SEC = max(1.0, float(os.environ.get("VISION_CAMERA_FRAME_STALE_SEC", "10")))
 
 # Beta AI models (weights are not in git — run: python download_owlv2.py)
 # Override local folder with VISION_OWLV2_LOCAL_PATH if the model lives elsewhere.
 OWLV2_MODEL_ID = os.environ.get("VISION_OWLV2_MODEL", "google/owlv2-base-patch16-ensemble")
+YOLO_WORLD_MODEL = os.environ.get("VISION_YOLO_WORLD_MODEL", "yolov8s-world.pt").strip()
+YOLO_WORLD_IMGSZ = max(320, int(os.environ.get("VISION_YOLO_WORLD_IMGSZ", "640")))
+AUTOTRACK_INFER_FPS = max(0.1, float(os.environ.get("VISION_AUTOTRACK_INFER_FPS", "1.0")))
 QWEN25VL_LOCAL_PATH = os.environ.get("VISION_QWEN25VL_LOCAL_PATH", "").strip()
 OWLV2_LOCAL_PATH = os.environ.get("VISION_OWLV2_LOCAL_PATH", "").strip()
 
@@ -55,14 +59,26 @@ def _default_vlm_device() -> str:
 
 VLM_DEVICE = _default_vlm_device()
 
-# OWLv2 tuning — 0 FPS = run as fast as the device allows (GPU) / ~2 FPS on CPU
-OWLV2_INFER_FPS = float(os.environ.get("VISION_OWLV2_INFER_FPS", "0"))
+# OWLv2 tuning — keep a very sparse keyframe schedule on smaller GPUs.
+# 0 FPS = run as fast as the device allows; for small hardware use a bounded heartbeat.
+OWLV2_INFER_FPS = float(os.environ.get("VISION_OWLV2_INFER_FPS", "2.0"))
 OWLV2_WORKERS = max(1, int(os.environ.get("VISION_OWLV2_WORKERS", "1")))
-OWLV2_SCHEDULER_FPS = max(1.0, float(os.environ.get("VISION_OWLV2_SCHEDULER_FPS", "10")))
-OWLV2_INFER_MAX_WIDTH = int(os.environ.get("VISION_OWLV2_INFER_MAX_WIDTH", "640"))
+OWLV2_SCHEDULER_FPS = max(1.0, float(os.environ.get("VISION_OWLV2_SCHEDULER_FPS", "4.0")))
+OWLV2_INFER_MAX_WIDTH = int(os.environ.get("VISION_OWLV2_INFER_MAX_WIDTH", "480"))
 OWLV2_NMS_IOU = float(os.environ.get("VISION_OWLV2_NMS_IOU", "0.42"))
 OWLV2_MAX_DETECTIONS = int(os.environ.get("VISION_OWLV2_MAX_DETECTIONS", "8"))
-OWLV2_MIN_BOX_AREA = int(os.environ.get("VISION_OWLV2_MIN_BOX_AREA", "900"))
+OWLV2_MIN_BOX_AREA = int(os.environ.get("VISION_OWLV2_MIN_BOX_AREA", "500"))
+OWLV2_MOTION_GATE_ENABLED = os.environ.get("VISION_OWLV2_MOTION_GATE", "1").strip().lower() in ("1", "true", "yes")
+OWLV2_MOTION_THRESHOLD = float(os.environ.get("VISION_OWLV2_MOTION_THRESHOLD", "0.012"))
+OWLV2_HEARTBEAT_SEC = float(os.environ.get("VISION_OWLV2_HEARTBEAT_SEC", "1.5"))
+OWLV2_TRACKER_ROI_PAD = int(os.environ.get("VISION_OWLV2_TRACKER_ROI_PAD", "32"))
+OWLV2_USE_FP16 = os.environ.get("VISION_OWLV2_USE_FP16", "1").strip().lower() in ("1", "true", "yes")
+OWLV2_USE_BF16 = os.environ.get("VISION_OWLV2_USE_BF16", "0").strip().lower() in ("1", "true", "yes")
+OWLV2_USE_AUTOCast = os.environ.get("VISION_OWLV2_USE_AUTOCast", "1").strip().lower() in ("1", "true", "yes")
+OWLV2_QUANT_MODE = os.environ.get("VISION_OWLV2_QUANT_MODE", "fp16").strip().lower()
+OWLV2_TENSORRT_ENABLED = os.environ.get("VISION_OWLV2_TENSORRT", "0").strip().lower() in ("1", "true", "yes")
+OWLV2_STATIC_SHAPE = os.environ.get("VISION_OWLV2_STATIC_SHAPE", "1").strip().lower() in ("1", "true", "yes")
+OWLV2_MAX_BATCH = max(1, int(os.environ.get("VISION_OWLV2_MAX_BATCH", "1")))
 
 # CPU thread limits (avoid oversubscription on demo machines)
 TORCH_THREADS = int(os.environ.get("VISION_TORCH_THREADS", "2"))

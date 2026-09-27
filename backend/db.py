@@ -150,7 +150,8 @@ def init_db():
             enabled INTEGER DEFAULT 0,
             prompt TEXT DEFAULT '',
             camera_ids TEXT DEFAULT '[]',
-            confidence REAL DEFAULT 0.2
+            confidence REAL DEFAULT 0.2,
+            model TEXT DEFAULT 'owlv2'
         );
         """
     )
@@ -177,6 +178,8 @@ def init_db():
         conn.execute("ALTER TABLE automode_settings ADD COLUMN schedule_start TEXT DEFAULT ''")
     if "schedule_end" not in auto_cols:
         conn.execute("ALTER TABLE automode_settings ADD COLUMN schedule_end TEXT DEFAULT ''")
+    if "model" not in auto_cols:
+        conn.execute("ALTER TABLE automode_settings ADD COLUMN model TEXT DEFAULT 'owlv2'")
     beta_cols = {r[1] for r in conn.execute("PRAGMA table_info(beta_settings)").fetchall()}
     if "schedule_enabled" not in beta_cols:
         conn.execute("ALTER TABLE beta_settings ADD COLUMN schedule_enabled INTEGER DEFAULT 0")

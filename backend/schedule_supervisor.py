@@ -73,7 +73,9 @@ def enforce_schedules(start_beta_fn=None):
             stop_automode_processors()
             logger.info("Schedule pause Auto Mode")
         elif due and not running and cfg.get("camera_ids"):
-            start_automode_processors(cfg["camera_ids"], cfg["prompt"], cfg["confidence"])
+            start_automode_processors(
+                cfg["camera_ids"], cfg["prompt"], cfg["confidence"], cfg.get("model", "owlv2")
+            )
     except Exception as e:
         logger.debug("Auto Mode schedule: %s", e)
 

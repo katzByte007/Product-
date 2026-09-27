@@ -2,7 +2,7 @@
 
 ## 1. Scope and Design Intent
 
-This document describes the current VMS architecture, the functional flow of a camera event, the module-level interactions, and the deployment architecture required for a 100-camera industrial installation.
+This document describes the current VMS architecture, the functional flow of a camera event, the module-level interactions, and the deployment architecture for the revised 50-camera target. See `VMS_SCALING_ROADMAP.md` for phased validation and acceptance criteria.
 
 The application is intentionally demo-first:
 
@@ -343,19 +343,19 @@ flowchart TB
 - Evidence: alert snapshots are stored under the configured alerts directory and referenced by alert records.
 - Configuration portability: camera paths are remapped by filename under `VISION_VIDEOS_DIR`; model paths are resolved from `models/` and the repository root.
 
-## 8. Target Enterprise Deployment for 100 Cameras
+## 8. Target Enterprise Deployment for 50 Cameras
 
-The current single-process design is appropriate for a demo and small pilot. For 100 cameras, use process isolation by workload and GPU. Keep the browser/API path responsive even when inference is saturated.
+The current single-process design is appropriate for a demo and small pilot. For the 50-camera target, use process isolation by workload and GPU. Keep the browser/API path responsive even when inference is saturated. Autotrack must use one deployment-selected model, OWLv2 or YOLO-World; these are alternatives, not concurrent workloads.
 
 ```mermaid
 flowchart LR
-    Cameras[100 RTSP cameras]
+    Cameras[50 RTSP cameras]
     Ingest[Ingest gateway / camera workers\nlatest frame per camera\nreconnect and health state]
     Bus[(Bounded frame metadata bus\nRedis Streams, NATS, or broker)]
     API[Flask API + React\ncontrol plane]
     DB[(PostgreSQL recommended\nSQLite remains pilot option)]
-    S1[GPU worker group 1\nYOLO replicas + OWLv2 replica]
-    S2[GPU worker group 2\nYOLO replicas + OWLv2 replica]
+    S1[GPU worker group 1\nYOLO replicas + selected Autotrack model]
+    S2[GPU worker group 2\nYOLO replicas + selected Autotrack model]
     S3[GPU worker group N\ncapacity-based shard]
     Alerts[Alert service\ncooldown + evidence]
     Store[Object/NVMe evidence store]
@@ -389,7 +389,7 @@ flowchart LR
 | API/control plane | Flask routes, authentication, configuration, alert queries, UI serving | No model forward pass; restart independently |
 | Ingest workers | RTSP/file decode, reconnect, latest-frame retention, camera health | Bound camera count per process; no unbounded queues |
 | YOLO GPU workers | Shared model replicas, cross-camera micro-batching, tracking callbacks | Pin process to one GPU; one replica per model family per worker |
-| OWLv2 GPU workers | Text-label batches, open-vocabulary inference, per-camera post-processing | Pin process to one GPU; bounded worker count and model memory budget |
+| Autotrack GPU workers | Text-label batches and per-camera post-processing using the selected OWLv2 or YOLO-World model | Pin process to one GPU; bounded worker count and model memory budget; do not load both alternatives |
 | Alert/evidence service | Cooldown, durable alert events, snapshot storage, notifications | Decouple disk/network latency from inference workers |
 | Metrics service | FPS, queue age, drops, latency, GPU/CPU/memory, health | Retain time-series data outside application process |
 
@@ -408,23 +408,22 @@ flowchart LR
 
 The following is a starting configuration, not a certification claim. Final sizing requires measurement with the exact camera resolutions, model weights, labels, alert rate, and target FPS.
 
-### Minimum practical enterprise pilot
+### Target hardware tier (not yet validated)
 
-- 16 to 24 CPU cores.
-- 64 GB RAM.
-- 1 TB or larger NVMe for local evidence and logs.
-- 10 GbE networking where camera traffic is centralized.
-- Two NVIDIA L4 24 GB GPUs, or equivalent inference GPUs.
+- 8 to 12 CPU cores.
+- 32 GB RAM.
+- One NVIDIA GPU with 8 GB VRAM.
+- NVMe sized for the agreed evidence-retention period and camera bitrate.
 - Separate API/control-plane process and GPU worker processes.
-- PostgreSQL for durable multi-process state; SQLite is acceptable only when the deployment remains single-process.
+- PostgreSQL is recommended for multi-process state; SQLite is a pilot option.
 
 ### Calculation assumptions
 
-- 100 cameras, mostly 720p, with a smaller 1080p tier.
+- 50 cameras at the resolutions and bitrates measured in Phase 1.
 - Display streaming is sampled independently from AI inference.
 - Fixed YOLO models run at approximately 2 to 10 FPS depending on use case and risk tier.
-- OWLv2 is sampled at a lower rate, for example 0.2 to 1 FPS per camera, unless a safety workflow justifies more.
-- Approximately three logical model tasks per camera does not mean three full-rate forwards per camera.
+- Autotrack uses one selected open-vocabulary model (OWLv2 or YOLO-World).
+- Three required detection outcomes per camera do not imply three full-rate forwards; compatible prompts should share a forward where the selected model supports it.
 - Model replicas are sharded across GPUs; one global process lock is not used across the deployment.
 - Camera decoding, JPEG streaming, inference, alert persistence, and notifications have separate resource budgets.
 
@@ -473,20 +472,19 @@ The current scheduler is a significant control-plane improvement, but the follow
 1. The current scheduler is process-local. Multi-GPU sharding and worker supervision are deployment responsibilities, not implemented by `python app.py`.
 2. The primary OWLv2 model forward remains serialized by a process-local fair gate. Additional throughput requires model replicas in separate GPU workers.
 3. The legacy analytics module has its own OWLv2 model-loading globals, so model ownership is not yet fully unified across every code path.
-4. The existing benchmark demonstrates 100-camera admission and stale-frame control, not 100 cameras running three real AI models at target FPS.
+4. Existing scheduler stress tests demonstrate admission and stale-frame control, not 50 cameras meeting the refined full detection load at target FPS.
 5. A real three-clone Beta OWLv2 replay completed 6 inferences in 24 seconds (0.25 aggregate FPS) with 576 stale submissions dropped and 0 scheduler errors; one in-process serialized replica cannot meet high-rate multi-camera inference.
 6. RTSP ingest, reconnect policy, network jitter handling, and camera health persistence require a production ingest worker.
 7. SQLite is not the preferred durable store for multiple inference processes writing alerts concurrently.
 8. GPU utilization, end-to-end alert latency, and per-camera SLOs still need to be measured on the proposed NVIDIA hardware.
 
-Recommended implementation order:
+Recommended implementation order, aligned with `VMS_SCALING_ROADMAP.md`:
 
-1. Add a process supervisor and GPU worker configuration.
-2. Move frame transport to a bounded inter-process bus or co-located camera/inference shards.
-3. Unify OWLv2 model loading and label-batch handling within each worker.
-4. Add a real 100-camera replay benchmark with three configured model tasks per camera.
-5. Record p50/p95 inference latency, camera FPS, queue age, drops, CPU, RAM, GPU utilization, GPU memory, and alert latency.
-6. Replace or harden SQLite for multi-process deployments.
+1. Complete Phase 1 ingest and single-detector measurements on the Windows validation machine.
+2. Evaluate OWLv2 and YOLO-World against the same attribute prompt set and labeled validation data; select one Autotrack model.
+3. Validate the chosen workload at 50 cameras on the target 8 GB VRAM / 8-12 core / 32 GB box.
+4. Add or harden process supervision, bounded frame transport, and worker isolation only where Phase 1-3 measurements show the current process topology is the limiting factor.
+5. Complete the full-load soak and handover deliverables.
 
 ## 12. Requirement Traceability
 
@@ -494,7 +492,7 @@ Recommended implementation order:
 | --- | --- |
 | Updated source and architecture changes | Shared latest-frame OWLv2 scheduler and processor integrations are implemented |
 | Camera/model process model | Current single-process model documented; target GPU-sharded model specified |
-| Hardware recommendation | Two 24 GB inference GPUs, 16-24 CPU cores, 64 GB RAM, NVMe, 10 GbE starting point |
+| Hardware recommendation | One 8 GB VRAM GPU, 8-12 CPU cores, 32 GB RAM target; not yet validated |
 | Performance results | Local M4 baseline and scheduler stress results documented in `README.md` |
 | Remaining bottlenecks | Serialized OWLv2, process-local scheduler, SQLite, RTSP and multi-GPU gaps documented above |
 | Preserve application purpose | Existing camera, zone, alert, scheduling, UI, YOLO, OWLv2, and engineer workflows retained |

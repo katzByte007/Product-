@@ -70,6 +70,15 @@ python app.py
 ```
 
 Without local weights, OWLv2 will try to download from HuggingFace on first use.
+Autotrack allows exactly one selected prompt detector at a time: OWLv2 or
+YOLO-World. YOLO-World model initialization occurs when Autotrack is applied;
+the selected model and prompt are shared across its cameras. The default FPS
+below is a configurable operating value, not the acceptance threshold; the
+agreed rate remains a Phase 2 decision.
+Use `evaluate_attribute_models.py` with a labeled JSONL set to compare
+per-prompt precision/recall and warm inference latency before choosing the
+deployment model. Do not select a lower-cost model unless it meets the agreed
+accuracy bar.
 
 ---
 
@@ -81,6 +90,9 @@ Paths default to folders next to `app.py`. Override them with environment variab
 | --- | --- | --- |
 | OWLv2 weights | `VISION_OWLV2_LOCAL_PATH` | `models/owlv2` (auto-discovered) |
 | HuggingFace model id | `VISION_OWLV2_MODEL` | `google/owlv2-base-patch16-ensemble` |
+| Autotrack YOLO-World weights | `VISION_YOLO_WORLD_MODEL` | `yolov8s-world.pt` |
+| Autotrack YOLO-World image size | `VISION_YOLO_WORLD_IMGSZ` | `640` |
+| Autotrack inference budget | `VISION_AUTOTRACK_INFER_FPS` | `1.0` per selected camera |
 | Camera videos | `VISION_VIDEOS_DIR` | `data/videos` |
 | YOLO / detector weights | — | `models\` (e.g. `yolov8m.pt`, `ANPRlib.pt`) |
 | Port | `FOOD_VISION_PORT` | `8765` |
@@ -126,8 +138,10 @@ YOLO workloads already use shared model engines with micro-batching.
 For an enterprise deployment, run camera groups as separate worker processes
 and assign each process to a GPU. Keep the Flask/API process separate from
 inference workers. Use bounded process queues, NVMe for alert snapshots, and
-64 GB RAM or more for 100 mixed-resolution streams. Do not create one OS
-process per camera; inference should be scheduled across cameras.
+the revised target tier of one 8 GB VRAM GPU, 8-12 CPU cores, and 32 GB RAM.
+That tier is not yet validated for 50-camera service; see
+`VMS_SCALING_ROADMAP.md` for the phased benchmark and acceptance gates. Do not
+create one OS process per camera; inference should be scheduled across cameras.
 
 ### Scaling benchmark
 
