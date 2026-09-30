@@ -59,6 +59,24 @@ def _default_vlm_device() -> str:
 
 VLM_DEVICE = _default_vlm_device()
 
+# Cross-camera person Re-ID is optional and remains disabled until a local
+# checkpoint and plant-specific validation approval are supplied.
+VISION_REID_ENABLED = os.environ.get("VISION_REID_ENABLED", "0").strip().lower() in ("1", "true", "yes")
+VISION_REID_MODEL = os.environ.get("VISION_REID_MODEL", "osnet_ain_x1_0").strip()
+VISION_REID_WEIGHTS = os.environ.get(
+    "VISION_REID_WEIGHTS",
+    os.path.join(BASE_DIR, "models", "reid", "osnet_ain_x1_0", "model.pth"),
+).strip()
+VISION_REID_DEVICE = os.environ.get("VISION_REID_DEVICE", "auto").strip().lower()
+VISION_REID_VALIDATION_STATUS = os.environ.get("VISION_REID_VALIDATION_STATUS", "pending").strip().lower()
+VISION_REID_VALIDATION_DATASET = os.environ.get("VISION_REID_VALIDATION_DATASET", "").strip()
+VISION_REID_SIMILARITY_THRESHOLD = os.environ.get("VISION_REID_SIMILARITY_THRESHOLD", "").strip()
+VISION_REID_WEIGHTS_SHA256 = os.environ.get("VISION_REID_WEIGHTS_SHA256", "").strip().lower()
+VISION_REID_QUEUE_SIZE = max(1, int(os.environ.get("VISION_REID_QUEUE_SIZE", "64")))
+VISION_REID_SAMPLE_INTERVAL_SEC = max(
+    0.0, float(os.environ.get("VISION_REID_SAMPLE_INTERVAL_SEC", "1.0"))
+)
+
 # OWLv2 tuning — keep a very sparse keyframe schedule on smaller GPUs.
 # 0 FPS = run as fast as the device allows; for small hardware use a bounded heartbeat.
 OWLV2_INFER_FPS = float(os.environ.get("VISION_OWLV2_INFER_FPS", "2.0"))

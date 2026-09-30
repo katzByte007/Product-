@@ -105,7 +105,7 @@ class Owlv2Scheduler:
             for key, job in jobs:
                 if now - job["last_submit"] < job["interval"]:
                     continue
-                frame = job["reader"].get_frame()
+                frame = job["reader"].get_frame(copy=False)
                 if frame is not None:
                     with self._condition:
                         current = self._jobs.get(key)

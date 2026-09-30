@@ -16,6 +16,8 @@ import logging
 import os
 import sqlite3
 import threading
+import time
+import uuid
 from functools import wraps
 
 from flask import Flask, Response, jsonify, request, send_from_directory, session
@@ -23,6 +25,10 @@ from flask_cors import CORS
 from werkzeug.utils import secure_filename
 
 from backend import beta_ai
+from backend.cross_camera_tracking import (
+    CameraTransition,
+    cross_camera_tracker,
+)
 from backend.db import ensure_demo_user, get_db, init_db, seed_default_cameras
 from backend.paths import migrate_camera_video_paths, resolve_video_path
 from backend.detection_routes import register_detection_routes
@@ -60,7 +66,27 @@ from backend.runtime import (
 from backend.stream import get_stream_publisher, start_stream_publisher, stop_stream_publisher
 from backend.video_reader import VideoFileReader
 from backend.owlv2_scheduler import owlv2_scheduler_stats
-from config import BASE_DIR, DISPLAY_FPS, HOST, PORT, VIDEOS_DIR, VLM_DEVICE, log_paths, pick_listen_port, server_access_urls
+from config import (
+    BASE_DIR,
+    DISPLAY_FPS,
+    HOST,
+    PORT,
+    VIDEOS_DIR,
+    VLM_DEVICE,
+    VISION_REID_DEVICE,
+    VISION_REID_ENABLED,
+    VISION_REID_MODEL,
+    VISION_REID_QUEUE_SIZE,
+    VISION_REID_SAMPLE_INTERVAL_SEC,
+    VISION_REID_SIMILARITY_THRESHOLD,
+    VISION_REID_VALIDATION_DATASET,
+    VISION_REID_VALIDATION_STATUS,
+    VISION_REID_WEIGHTS,
+    VISION_REID_WEIGHTS_SHA256,
+    log_paths,
+    pick_listen_port,
+    server_access_urls,
+)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
@@ -72,6 +98,7 @@ app.config["MAX_CONTENT_LENGTH"] = int(os.environ.get("VISION_MAX_UPLOAD_MB", "2
 CORS(app, supports_credentials=True)
 
 ALLOWED_EXT = {".mp4", ".avi", ".mov", ".webm", ".mkv"}
+cross_camera_reid_config = {"enabled": False, "reason": "not_initialized"}
 
 
 def login_required(f):
@@ -263,6 +290,323 @@ def api_list_cameras():
     return jsonify([_camera_row_to_dict(r, enabled) for r in rows])
 
 
+def _load_camera_transitions():
+    conn = get_db()
+    rows = conn.execute(
+        "SELECT source_camera_id, destination_camera_id, min_transition_seconds, "
+        "max_transition_seconds, source_zone_id, destination_zone_id, enabled "
+        "FROM camera_transitions ORDER BY id"
+    ).fetchall()
+    conn.close()
+    return [
+        CameraTransition(
+            source_camera_id=row["source_camera_id"],
+            destination_camera_id=row["destination_camera_id"],
+            min_seconds=row["min_transition_seconds"],
+            max_seconds=row["max_transition_seconds"],
+            source_zone_id=row["source_zone_id"],
+            destination_zone_id=row["destination_zone_id"],
+            enabled=bool(row["enabled"]),
+        )
+        for row in rows
+    ]
+
+
+def _configure_reid_provider():
+    global cross_camera_reid_config
+    from backend.cross_camera_tracking import configure_reid_provider
+
+    if not VISION_REID_ENABLED:
+        configure_reid_provider(None)
+        cross_camera_reid_config = {"enabled": False, "reason": "disabled_by_configuration"}
+        return cross_camera_reid_config
+    if VISION_REID_MODEL != "osnet_ain_x1_0":
+        configure_reid_provider(None)
+        cross_camera_reid_config = {"enabled": False, "reason": "unsupported_model"}
+        return cross_camera_reid_config
+    if VISION_REID_VALIDATION_STATUS != "approved" or not VISION_REID_VALIDATION_DATASET:
+        configure_reid_provider(None)
+        cross_camera_reid_config = {"enabled": False, "reason": "validation_not_approved"}
+        return cross_camera_reid_config
+    try:
+        threshold = float(VISION_REID_SIMILARITY_THRESHOLD)
+    except (TypeError, ValueError):
+        configure_reid_provider(None)
+        cross_camera_reid_config = {"enabled": False, "reason": "validated_threshold_required"}
+        return cross_camera_reid_config
+    if not -1.0 <= threshold <= 1.0:
+        configure_reid_provider(None)
+        cross_camera_reid_config = {"enabled": False, "reason": "invalid_validated_threshold"}
+        return cross_camera_reid_config
+    if len(VISION_REID_WEIGHTS_SHA256) != 64 or any(
+        character not in "0123456789abcdef" for character in VISION_REID_WEIGHTS_SHA256
+    ):
+        configure_reid_provider(None)
+        cross_camera_reid_config = {"enabled": False, "reason": "approved_checkpoint_sha256_required"}
+        return cross_camera_reid_config
+    try:
+        digest = hashlib.sha256()
+        with open(VISION_REID_WEIGHTS, "rb") as checkpoint:
+            for chunk in iter(lambda: checkpoint.read(1024 * 1024), b""):
+                digest.update(chunk)
+    except OSError:
+        configure_reid_provider(None)
+        cross_camera_reid_config = {"enabled": False, "reason": "checkpoint_not_readable"}
+        return cross_camera_reid_config
+    actual_hash = digest.hexdigest()
+    if actual_hash != VISION_REID_WEIGHTS_SHA256:
+        configure_reid_provider(None)
+        cross_camera_reid_config = {"enabled": False, "reason": "checkpoint_sha256_mismatch"}
+        return cross_camera_reid_config
+
+    try:
+        from backend.reid.torchreid_osnet import OSNetAINProvider
+
+        provider = OSNetAINProvider(VISION_REID_WEIGHTS, device=VISION_REID_DEVICE)
+        configure_reid_provider(
+            provider,
+            max_queue_size=VISION_REID_QUEUE_SIZE,
+            min_similarity=threshold,
+        )
+        cross_camera_reid_config = {
+            "enabled": True,
+            "provider": "torchreid_osnet_ain_x1_0",
+            "model": VISION_REID_MODEL,
+            "validation_status": VISION_REID_VALIDATION_STATUS,
+            "validation_dataset": VISION_REID_VALIDATION_DATASET,
+            "similarity_threshold": threshold,
+            "weights_sha256": actual_hash,
+            "weights_path": VISION_REID_WEIGHTS,
+            "device": provider.device_name,
+        }
+        return cross_camera_reid_config
+    except Exception as exc:
+        logger.exception("OSNet-AIN Re-ID provider could not be initialized")
+        configure_reid_provider(None)
+        cross_camera_reid_config = {"enabled": False, "reason": f"provider_initialization_failed: {exc}"}
+        return cross_camera_reid_config
+
+
+@app.route("/api/camera-transitions", methods=["GET"])
+@login_required
+def api_camera_transitions():
+    if request.method == "GET":
+        return jsonify([
+            {
+                "source_camera_id": transition.source_camera_id,
+                "destination_camera_id": transition.destination_camera_id,
+                "min_seconds": transition.min_seconds,
+                "max_seconds": transition.max_seconds,
+                "source_zone_id": transition.source_zone_id,
+                "destination_zone_id": transition.destination_zone_id,
+                "enabled": transition.enabled,
+            }
+            for transition in _load_camera_transitions()
+        ])
+
+    return jsonify({"error": "Use PUT to replace camera transition rules"}), 405
+
+
+@app.route("/api/camera-transitions", methods=["PUT"])
+@login_required
+def api_replace_camera_transitions():
+    data = request.get_json(silent=True)
+    if not isinstance(data, list):
+        return jsonify({"error": "Expected a JSON array of transitions"}), 400
+
+    configured = []
+    try:
+        for item in data:
+            if not isinstance(item, dict):
+                raise ValueError("Each transition must be an object")
+            source_camera_id = item.get("source_camera_id")
+            destination_camera_id = item.get("destination_camera_id")
+            enabled = item.get("enabled", True)
+            if not isinstance(source_camera_id, str) or not isinstance(destination_camera_id, str):
+                raise ValueError("Transition camera IDs must be strings")
+            if not isinstance(enabled, bool):
+                raise ValueError("Transition enabled must be a boolean")
+            configured.append(CameraTransition(
+                source_camera_id=source_camera_id.strip(),
+                destination_camera_id=destination_camera_id.strip(),
+                min_seconds=float(item.get("min_seconds", 0)),
+                max_seconds=float(item["max_seconds"]),
+                source_zone_id=item.get("source_zone_id") or None,
+                destination_zone_id=item.get("destination_zone_id") or None,
+                enabled=enabled,
+            ))
+        routes = [(
+            item.source_camera_id,
+            item.destination_camera_id,
+            item.source_zone_id,
+            item.destination_zone_id,
+        ) for item in configured]
+        if len(routes) != len(set(routes)):
+            raise ValueError("Duplicate camera and zone transition routes are not supported")
+
+        conn = get_db()
+        try:
+            camera_ids = {row[0] for row in conn.execute("SELECT camera_id FROM cameras").fetchall()}
+            if any(
+                item.source_camera_id not in camera_ids or item.destination_camera_id not in camera_ids
+                for item in configured
+            ):
+                return jsonify({"error": "Transition references an unknown camera"}), 400
+            with conn:
+                conn.execute("DELETE FROM camera_transitions")
+                conn.executemany(
+                    "INSERT INTO camera_transitions (source_camera_id, destination_camera_id, "
+                    "min_transition_seconds, max_transition_seconds, source_zone_id, "
+                    "destination_zone_id, enabled) VALUES (?,?,?,?,?,?,?)",
+                    [(
+                        item.source_camera_id, item.destination_camera_id,
+                        item.min_seconds, item.max_seconds, item.source_zone_id,
+                        item.destination_zone_id, int(item.enabled),
+                    ) for item in configured],
+                )
+        finally:
+            conn.close()
+    except (KeyError, TypeError, ValueError) as exc:
+        return jsonify({"error": str(exc)}), 400
+
+    cross_camera_tracker.set_transitions(configured)
+    return jsonify({"success": True, "count": len(configured)})
+
+
+@app.route("/api/cross-camera/candidates")
+@login_required
+def api_cross_camera_candidates():
+    return jsonify([candidate.__dict__ for candidate in cross_camera_tracker.candidates()])
+
+
+@app.route("/api/cross-camera/reid-stats")
+@login_required
+def api_cross_camera_reid_stats():
+    return jsonify(cross_camera_tracker.reid_stats())
+
+
+@app.route("/api/cross-camera/reid-status")
+@login_required
+def api_cross_camera_reid_status():
+    return jsonify({**cross_camera_reid_config, "runtime": cross_camera_tracker.reid_stats()})
+
+
+@app.route("/api/cross-camera/candidates/<candidate_id>/confirm", methods=["POST"])
+@login_required
+def api_confirm_cross_camera_candidate(candidate_id):
+    candidate = cross_camera_tracker.get_candidate(candidate_id)
+    if candidate is None:
+        return jsonify({"error": "Candidate not found or expired"}), 404
+    if candidate.status != "candidate":
+        return jsonify({"error": "Candidate has already been confirmed"}), 409
+
+    data = request.get_json(silent=True) or {}
+    global_track_id = (data.get("global_track_id") or f"P{uuid.uuid4().hex[:12].upper()}").strip()
+    if not global_track_id:
+        return jsonify({"error": "global_track_id must not be empty"}), 400
+
+    start_time = min(candidate.source_start_time, candidate.destination_start_time)
+    end_time = max(candidate.source_end_time, candidate.destination_end_time)
+    conn = get_db()
+    try:
+        with conn:
+            duplicate = conn.execute(
+                "SELECT global_track_id FROM global_candidate_confirmations WHERE candidate_id=?",
+                (candidate_id,),
+            ).fetchone()
+            if duplicate:
+                return jsonify({"error": "Candidate has already been confirmed"}), 409
+
+            existing = conn.execute(
+                "SELECT class_id, status FROM global_tracks WHERE global_track_id=?",
+                (global_track_id,),
+            ).fetchone()
+            if existing and existing["class_id"] != candidate.class_id:
+                return jsonify({"error": "Global track class does not match candidate"}), 409
+            if existing and existing["status"] == "closed":
+                return jsonify({"error": "Cannot append to a closed global track"}), 409
+
+            conn.execute(
+                "INSERT INTO global_candidate_confirmations (candidate_id, global_track_id) VALUES (?,?)",
+                (candidate_id, global_track_id),
+            )
+            conn.execute(
+                "INSERT INTO global_tracks (global_track_id, class_id, first_seen, last_seen, current_camera_id, status) "
+                "VALUES (?,?,?,?,?,'active') ON CONFLICT(global_track_id) DO UPDATE SET "
+                "first_seen=MIN(global_tracks.first_seen, excluded.first_seen), "
+                "last_seen=MAX(global_tracks.last_seen, excluded.last_seen), "
+                "current_camera_id=excluded.current_camera_id, status='active'",
+                (
+                    global_track_id, candidate.class_id, start_time, end_time,
+                    candidate.destination_camera_id,
+                ),
+            )
+            conn.executemany(
+                "INSERT OR IGNORE INTO global_track_segments "
+                "(global_track_id, camera_id, tracker_source, local_track_id, start_time, end_time, "
+                "entry_zone, exit_zone, match_confidence, candidate_id) VALUES (?,?,?,?,?,?,?,?,?,?)",
+                [
+                    (
+                        global_track_id, candidate.source_camera_id, candidate.source_tracker,
+                        candidate.source_local_track_id, candidate.source_start_time,
+                        candidate.source_end_time, candidate.source_entry_zone,
+                        candidate.source_exit_zone, candidate.confidence, candidate_id,
+                    ),
+                    (
+                        global_track_id, candidate.destination_camera_id,
+                        candidate.destination_tracker, candidate.destination_local_track_id,
+                        candidate.destination_start_time, candidate.destination_end_time,
+                        candidate.destination_entry_zone, candidate.destination_exit_zone,
+                        candidate.confidence, candidate_id,
+                    ),
+                ],
+            )
+    except sqlite3.IntegrityError:
+        return jsonify({"error": "Candidate was confirmed concurrently"}), 409
+    finally:
+        conn.close()
+
+    cross_camera_tracker.confirm_candidate(candidate_id)
+    return jsonify({"success": True, "global_track_id": global_track_id})
+
+
+@app.route("/api/cross-camera/global-tracks")
+@login_required
+def api_cross_camera_global_tracks():
+    conn = get_db()
+    now = time.time()
+    timeout = cross_camera_tracker.identity_timeout_sec
+    with conn:
+        conn.execute(
+            "UPDATE global_tracks SET status='closed' "
+            "WHERE status!='closed' AND last_seen<=?",
+            (now - timeout * 2,),
+        )
+        conn.execute(
+            "UPDATE global_tracks SET status='temporarily_lost' "
+            "WHERE status='active' AND last_seen<=? AND last_seen>?",
+            (now - timeout, now - timeout * 2),
+        )
+    rows = conn.execute(
+        "SELECT global_track_id, class_id, first_seen, last_seen, current_camera_id, status "
+        "FROM global_tracks ORDER BY last_seen DESC"
+    ).fetchall()
+    result = []
+    for row in rows:
+        segments = conn.execute(
+            "SELECT camera_id, tracker_source, local_track_id, start_time, end_time, "
+            "entry_zone, exit_zone, match_confidence FROM global_track_segments "
+            "WHERE global_track_id=? ORDER BY start_time",
+            (row["global_track_id"],),
+        ).fetchall()
+        result.append({
+            **dict(row),
+            "segments": [dict(segment) for segment in segments],
+        })
+    conn.close()
+    return jsonify(result)
+
+
 def _next_camera_id(conn):
     existing = {r["camera_id"] for r in conn.execute("SELECT camera_id FROM cameras").fetchall()}
     existing |= set(video_readers.keys())
@@ -338,8 +682,13 @@ def api_remove_camera(camera_id):
     _stop_camera(camera_id)
     conn = get_db()
     conn.execute("DELETE FROM cameras WHERE camera_id=?", (camera_id,))
+    conn.execute(
+        "DELETE FROM camera_transitions WHERE source_camera_id=? OR destination_camera_id=?",
+        (camera_id, camera_id),
+    )
     conn.commit()
     conn.close()
+    cross_camera_tracker.set_transitions(_load_camera_transitions())
     return jsonify({"success": True})
 
 
@@ -1068,6 +1417,8 @@ def create_app():
     if n:
         logger.info("Migrated %d camera video path(s) to current server layout", n)
     seed_default_cameras(_discover_seed_videos())
+    cross_camera_tracker.set_transitions(_load_camera_transitions())
+    _configure_reid_provider()
     _boot_cameras()
 
     def _restore_all():

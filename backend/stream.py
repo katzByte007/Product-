@@ -29,6 +29,10 @@ class StreamPublisher:
         self._running = False
         self._thread = None
         self._interval = 1.0 / max(1.0, DISPLAY_FPS)
+        self._idle_interval = max(self._interval, 1.0)
+        self._active_window = max(self._interval * 2, 0.5)
+        self._last_access = 0.0
+        self._wake_event = threading.Event()
         self._stagger_s = (int(hashlib.md5(camera_id.encode()).hexdigest()[:8], 16) % 1000) / 1000.0
 
     def start(self):
@@ -44,6 +48,7 @@ class StreamPublisher:
 
     def stop(self):
         self._running = False
+        self._wake_event.set()
         if self._thread and self._thread.is_alive():
             self._thread.join(timeout=3.0)
         with self._jpeg_lock:
@@ -51,7 +56,16 @@ class StreamPublisher:
 
     def get_jpeg(self):
         with self._jpeg_lock:
+            self._last_access = time.monotonic()
+            self._wake_event.set()
             return self._jpeg
+
+    def _publish_interval(self, now):
+        with self._jpeg_lock:
+            last_access = self._last_access
+        if last_access and now - last_access <= self._active_window:
+            return self._interval
+        return self._idle_interval
 
     def _scale(self, frame):
         if DISPLAY_MAX_WIDTH <= 0:
@@ -65,7 +79,15 @@ class StreamPublisher:
     def _loop(self):
         if self._stagger_s > 0:
             time.sleep(self._stagger_s)
+        last_encoded = 0.0
         while self._running:
+            interval = self._publish_interval(time.monotonic())
+            remaining = interval - (time.monotonic() - last_encoded)
+            if remaining > 0:
+                self._wake_event.wait(remaining)
+                self._wake_event.clear()
+                continue
+
             t0 = time.perf_counter()
             try:
                 frame = _build_display_frame(self.camera_id)
@@ -77,8 +99,12 @@ class StreamPublisher:
                             self._jpeg = buf.tobytes()
             except Exception as e:
                 logger.debug("StreamPublisher %s: %s", self.camera_id, e)
+            last_encoded = time.monotonic()
             elapsed = time.perf_counter() - t0
-            time.sleep(max(0.001, self._interval - elapsed))
+            remaining = max(0.0, interval - elapsed)
+            if remaining:
+                self._wake_event.wait(remaining)
+                self._wake_event.clear()
 
 
 def start_stream_publisher(camera_id: str):

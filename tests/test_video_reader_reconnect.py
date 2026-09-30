@@ -99,3 +99,16 @@ def test_reader_health_rejects_stale_and_reconnecting_frames(monkeypatch):
     reader.status = "reconnecting"
     assert reader.health["status"] == "reconnecting"
     assert reader.health["healthy"] is False
+
+
+def test_get_frame_returns_copy_by_default_and_supports_shared_read():
+    reader = video_reader.VideoFileReader("cam-1", "video.mp4")
+    reader.status = "active"
+    reader.frame = np.zeros((4, 4, 3), dtype=np.uint8)
+    reader.frame_ts = time.time()
+
+    copied = reader.get_frame()
+    shared = reader.get_frame(copy=False)
+
+    assert copied is not reader.frame
+    assert shared is reader.frame

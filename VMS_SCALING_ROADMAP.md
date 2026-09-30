@@ -12,7 +12,8 @@ This roadmap supersedes the earlier 100-camera / fixed YOLO + OWLv2 target.
 | Configuration A | Two fine-tuned custom YOLO models plus Autotrack |
 | Configuration B | One prompt-based Beta AI workload covering multiple prompts plus Autotrack |
 | Autotrack model | Exactly one deployment-level choice: OWLv2 or YOLO-World |
-| Target hardware | NVIDIA GPU with 8 GB VRAM, 8-12 CPU cores, 32 GB RAM |
+| Lower-cost comparison | NVIDIA GPU with 8 GB VRAM, 8-12 CPU cores, 32 GB RAM; not an assumed full-workload pass target |
+| Probable comfortable starting point | NVIDIA GPU with 24 GB VRAM, 16 CPU cores, 64 GB RAM; provisional until the selected full workload is benchmarked and soaked |
 | Operation | 24/7 RTSP streaming, with no process crashes or required restarts |
 
 Three detection outcomes are a business requirement, not a requirement for
@@ -25,9 +26,9 @@ results for accuracy evaluation.
 | Phase | Work | Status / exit evidence |
 | --- | --- | --- |
 | 0. Baseline | Establish M4/MPS limits and identify inference serialization versus ingest cost. | Complete: local report records roughly 1 OWLv2 forward/sec at saturation; this is not a 50-camera capacity claim. |
-| 1. Scaling PR validation | On Intel Core Ultra 7 / Windows / 16 GB, run six-camera baseline, 30-camera ingest-only, and 30-camera one-detector-per-camera tests. | In progress. Use file-based inputs; record stream health, per-camera completion, drops, frame age, latency, CPU, and RAM. |
+| 1. Scaling PR validation | On Intel Core Ultra 7 / Windows / 16 GB, run six-camera baseline, 30-camera ingest-only, and 30-camera one-detector-per-camera tests. | In progress. A local Apple M4/MPS cloned-file rehearsal is recorded in `data/benchmarks/PHASE1_LOCAL_MPS_REHEARSAL.md`; the required Windows validation-host runs remain outstanding. |
 | 2. Model evaluation | Compare OWLv2 and YOLO-World on the same labeled attribute-prompt set. Include precision/recall and latency/throughput under the same hardware and thresholds. | Next. Select one Autotrack model only after accuracy and speed results are reviewed. |
-| 3. Target-hardware validation | Run the selected configuration at 50 streams and full three-outcome prompt/model load on the 8 GB VRAM target. | Planned. Validate resource ceilings and agreed per-camera FPS/latency. |
+| 3. Target-hardware validation | Run the selected configuration at 50 streams and full three-outcome prompt/model load on the proposed 24 GB VRAM / 16-core / 64 GB starting host; include the 8 GB lower-cost comparison if available. | Planned. Validate resource ceilings and agreed per-camera FPS/latency; adjust GPU count from measured sustained throughput and VRAM headroom. |
 | 4. Reliability soak | Run the full target workload continuously for the agreed multi-day duration. | Planned. Require zero crashes, restarts, stream loss, and resource-limit violations. |
 | 5. Handover | Deliver code, deployment architecture, sizing assumptions, performance report, and remaining limits. | Planned. |
 
@@ -99,3 +100,11 @@ command. Record OS, CPU, RAM, GPU, driver, model weight names, video sources,
 and the exact command with each result. The benchmark profiles are measurement
 tools; they do not establish that the target hardware or product acceptance
 criteria have passed.
+
+The 2026-09-30 local MPS rehearsal is partial Phase 1 evidence only. Its
+30-camera, 60-second YOLO run completed 93 forwards with 94.7% scheduler drops,
+and its 30-reader ingest run reached 6.89 GB RSS on a 16 GB Mac. These local
+results are overload indicators, not target NVIDIA capacity or Phase 1 exit
+evidence. The hardware figures above are planning estimates, not proven
+minimums: first reduce model forwards per camera, then benchmark sustained
+per-model throughput with at least 30% reserve on the selected CUDA host.

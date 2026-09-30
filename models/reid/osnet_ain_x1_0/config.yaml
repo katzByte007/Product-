@@ -1,0 +1,20 @@
+enabled: false
+provider: torchreid_osnet_ain_x1_0
+model: osnet_ain_x1_0
+task: person_reid
+weights: models/reid/osnet_ain_x1_0/model.pth
+device: auto
+input:
+  height: 256
+  width: 128
+  channel_order: RGB
+  source_crop_order: BGR
+  mean: [0.485, 0.456, 0.406]
+  std: [0.229, 0.224, 0.225]
+validation:
+  status: pending
+  dataset: null
+  similarity_threshold: null
+  checkpoint_sha256: null
+  runtime_hash_environment_variable: VISION_REID_WEIGHTS_SHA256
+  checkpoint_license: pending_review

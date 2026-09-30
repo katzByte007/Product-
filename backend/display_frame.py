@@ -102,7 +102,7 @@ def build_display_frame(camera_id: str):
         active.append(("fr", fr_procs[camera_id]))
 
     reader = video_readers.get(camera_id)
-    frame = reader.get_frame() if reader else None
+    frame = reader.get_frame(copy=False) if reader else None
     if frame is None:
         return None
     if not active:
