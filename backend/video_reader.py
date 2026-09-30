@@ -146,13 +146,13 @@ class VideoFileReader:
             cap.release()
         self.status = "stopped"
 
-    def get_frame(self):
+    def get_frame(self, copy=True):
         with self.lock:
             if self.frame is None or self.status != "active":
                 return None
             if time.time() - self.frame_ts > CAMERA_FRAME_STALE_SEC:
                 return None
-            return self.frame.copy()
+            return self.frame.copy() if copy else self.frame
 
     @property
     def health(self):

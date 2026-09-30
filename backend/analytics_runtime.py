@@ -31,6 +31,11 @@ from scipy.optimize import linear_sum_assignment
 from ultralytics import YOLO
 
 from backend.db import get_db
+from backend.cross_camera_tracking import (
+    cross_camera_tracker,
+    crops_from_tracks,
+    observations_from_tracks,
+)
 from backend.inference_protocol import InferenceRequest
 from backend.owlv2_scheduler import get_owlv2_scheduler
 from backend.runtime import (
@@ -1086,7 +1091,7 @@ class InferenceEngine:
 
                 pending = []
                 for cid, info in snap:
-                    frame = info['reader'].get_frame()
+                    frame = info['reader'].get_frame(copy=False)
                     if frame is not None:
                         pending.append((cid, frame, info))
 
@@ -1299,6 +1304,7 @@ class HeadCountProcessor:
         self.stats = {'current_count': 0, 'total_entries': 0, 'max_id': 0, 'status': 'Initializing'}
         self._last_detections = []  # [(bbox, label, color), ...] for combined feed overlay
         self._loop_generation = getattr(camera_reader, 'loop_generation', 0)
+        self._cross_camera_frame_id = 0
 
         self.last_db_save = time.time()
         self.db_interval = 300
@@ -1327,6 +1333,7 @@ class HeadCountProcessor:
             loop_gen = getattr(self.camera_reader, 'loop_generation', 0)
             if loop_gen != self._loop_generation:
                 self._loop_generation = loop_gen
+                cross_camera_tracker.reset_source(self.camera_id, 'headcount')
                 self._reset_tracking_for_loop()
 
             # Suppress duplicate/overlapping boxes before tracking.
@@ -1335,6 +1342,15 @@ class HeadCountProcessor:
             detections = nms_detections(detections, scores, iou_thresh=0.35)
 
             tracked, current_ids = self.tracker.update(detections)
+            self._cross_camera_frame_id += 1
+            cross_camera_tracker.observe_camera(
+                self.camera_id,
+                'headcount',
+                observations_from_tracks(
+                    self.camera_id, tracked, time.time(), self._cross_camera_frame_id
+                ),
+                crops=crops_from_tracks(frame, tracked) if cross_camera_tracker.reid_enabled else None,
+            )
 
             new_ids = current_ids - self.seen_ids
             if new_ids:
@@ -1444,6 +1460,7 @@ class EntryExitProcessor:
         self.db_interval = 300
         self._last_detections = []
         self._loop_generation = getattr(camera_reader, 'loop_generation', 0)
+        self._cross_camera_frame_id = 0
 
     def _convert_zones(self, frame_w, frame_h):
         self.entry_zone_video = [
@@ -1483,6 +1500,7 @@ class EntryExitProcessor:
             loop_gen = getattr(self.camera_reader, 'loop_generation', 0)
             if loop_gen != self._loop_generation:
                 self._loop_generation = loop_gen
+                cross_camera_tracker.reset_source(self.camera_id, 'entryexit')
                 self.tracker = HeadCountTracker(max_age=120, min_hits=1, iou_threshold=0.4)
                 self.last_zone = {}
                 self._present_in_entry = set()
@@ -1493,6 +1511,28 @@ class EntryExitProcessor:
                 self.ids_pending_exit = set()
 
             tracked, current_ids = self.tracker.update(detections)
+            self._cross_camera_frame_id += 1
+
+            def _track_zone(person):
+                center = person.get('center')
+                if center and len(self.exit_zone_video) >= 3 and point_in_polygon(center, self.exit_zone_video):
+                    return 'exit'
+                if center and len(self.entry_zone_video) >= 3 and point_in_polygon(center, self.entry_zone_video):
+                    return 'entry'
+                return None
+
+            cross_camera_tracker.observe_camera(
+                self.camera_id,
+                'entryexit',
+                observations_from_tracks(
+                    self.camera_id,
+                    tracked,
+                    time.time(),
+                    self._cross_camera_frame_id,
+                    zone_resolver=_track_zone,
+                ),
+                crops=crops_from_tracks(frame, tracked) if cross_camera_tracker.reid_enabled else None,
+            )
 
             # Independent doors: ENTRY counts when a person first steps into the entry
             # polygon; EXIT counts when someone already inside first steps into the exit

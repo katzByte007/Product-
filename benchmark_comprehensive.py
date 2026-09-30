@@ -105,23 +105,45 @@ def run_mode(mode: str, camera_count: int, duration_sec: float, workers: int, ta
         process_cpu_start = process.cpu_times()
         read_count = 0
         read_age_samples = []
+        healthy_reader_samples = 0
+        unhealthy_reader_samples = 0
+        per_reader_health = {
+            str(reader.camera_id): {"healthy_samples": 0, "unhealthy_samples": 0}
+            for reader in readers
+        }
         deadline = start + duration_sec
         while time.perf_counter() < deadline:
             for reader in readers:
+                health = reader.health
+                reader_metrics = per_reader_health[str(reader.camera_id)]
+                if health["healthy"]:
+                    healthy_reader_samples += 1
+                    reader_metrics["healthy_samples"] += 1
+                else:
+                    unhealthy_reader_samples += 1
+                    reader_metrics["unhealthy_samples"] += 1
                 frame = reader.get_frame()
                 if frame is not None:
                     read_count += 1
-                    if reader.frame_ts:
-                        read_age_samples.append((time.time() - reader.frame_ts) * 1000.0)
+                    if health["frame_age_sec"] is not None:
+                        read_age_samples.append(health["frame_age_sec"] * 1000.0)
             time.sleep(0.02)
         elapsed = time.perf_counter() - start
         cpu_end = process.cpu_times()
         cpu_seconds = (cpu_end.user + cpu_end.system) - (process_cpu_start.user + process_cpu_start.system)
+        readers_healthy_at_end = sum(1 for reader in readers if reader.health["healthy"])
         metrics.update({
             "read_frames": read_count,
             "read_fps": read_count / max(elapsed, 1e-6),
-            "p50_frame_age_ms": statistics.median(read_age_samples) if read_age_samples else 0.0,
-            "p95_frame_age_ms": statistics.quantiles(read_age_samples, n=100)[94] if len(read_age_samples) >= 10 else (max(read_age_samples) if read_age_samples else 0.0),
+            "frame_age_p50_ms": statistics.median(read_age_samples) if read_age_samples else 0.0,
+            "frame_age_p95_ms": statistics.quantiles(read_age_samples, n=100)[94] if len(read_age_samples) >= 10 else (max(read_age_samples) if read_age_samples else 0.0),
+            "frame_age_p99_ms": statistics.quantiles(read_age_samples, n=100)[98] if len(read_age_samples) >= 100 else (max(read_age_samples) if read_age_samples else 0.0),
+            "readers_configured": len(readers),
+            "readers_healthy_at_end": readers_healthy_at_end,
+            "healthy_reader_samples": healthy_reader_samples,
+            "unhealthy_reader_samples": unhealthy_reader_samples,
+            "reader_health_ratio": healthy_reader_samples / max(1, healthy_reader_samples + unhealthy_reader_samples),
+            "reader_health_by_camera": per_reader_health,
             "rss_gb": process.memory_info().rss / (1024 ** 3),
             "cpu_seconds": cpu_seconds,
         })
@@ -213,8 +235,9 @@ def write_csv(rows, path):
         "callback_count", "callback_fps",
         "latency_p50_ms", "latency_p95_ms", "latency_p99_ms",
         "frame_age_p50_ms", "frame_age_p95_ms", "frame_age_p99_ms",
-        "read_frames", "read_fps", "rss_gb", "cpu_seconds",
-        "source_feeds", "model_task_map",
+        "read_frames", "read_fps", "readers_configured", "readers_healthy_at_end",
+        "healthy_reader_samples", "unhealthy_reader_samples", "reader_health_ratio",
+        "reader_health_by_camera", "rss_gb", "cpu_seconds", "source_feeds", "model_task_map",
     ]
     with path.open("w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)

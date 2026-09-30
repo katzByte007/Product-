@@ -100,8 +100,11 @@ flowchart TB
         subgraph YOLO[Shared fixed-model engines]
             Registry[ModelRegistry\none model cache per model path]
             Engine[InferenceEngine\nlatest frames + micro-batch]
-            Trackers[Kalman / assignment trackers]
+            Trackers[Per-camera Kalman / assignment trackers]
         end
+
+        CrossCamera[CrossCameraTracker\ntracklets + transition gates]
+        ReID[Optional bounded Re-ID worker\nprovider injected; disabled by default]
 
         subgraph VLM[Shared OWLv2 scheduling]
             Dispatch[Owlv2Scheduler\none dispatcher]
@@ -127,6 +130,10 @@ flowchart TB
     ReaderN --> Engine
     Registry --> Engine
     Engine --> Trackers
+    Trackers -->|TrackObservation + sampled crops| CrossCamera
+    CrossCamera -. optional embeddings .-> ReID
+    ReID -. embedding result .-> CrossCamera
+    CrossCamera -->|candidate / confirmed segments| DB
     Engine --> Alerts
     Model --> Alerts
     Pub1 --> Flask
@@ -139,8 +146,8 @@ flowchart TB
 
 1. `app.py` creates or stops a `VideoFileReader` and `StreamPublisher` for each camera.
 2. `backend/runtime.py` stores process-local dictionaries for readers, publishers, and processors.
-3. A reader owns one latest-frame slot, not an unbounded frame queue.
-4. `StreamPublisher` renders the current display frame and JPEG-encodes it at the configured display rate.
+3. A reader owns one latest-frame slot, not an unbounded frame queue. `get_frame()` returns a defensive copy by default; display publishing and YOLO/OWLv2 scheduling borrow the current frame reference on internal read-only paths. The reader replaces the reference and does not mutate a published array; annotation callbacks copy before drawing.
+4. `StreamPublisher` renders and encodes at the configured display rate for recently requested feeds, and falls back to 1 FPS for idle cameras so snapshots remain fresh without encoding every camera at the active-feed rate.
 5. YOLO processors register with shared `InferenceEngine` instances. The engine gathers due cameras and micro-batches frames for one model.
 6. OWLv2 processors register with `backend/owlv2_scheduler.py`. The dispatcher rotates its polling cursor across readers, replaces stale pending frames, and feeds bounded workers.
 7. `backend/beta_ai.py` owns the primary OWLv2 model and a fair model-forward gate. Intrusion and legacy analytics retain processor-specific post-processing and alert contracts.
@@ -236,6 +243,39 @@ flowchart LR
 
 YOLO is the high-throughput tier. Its shared `InferenceEngine` is the correct abstraction for batching frames from cameras using the same model and detection configuration.
 
+The headcount and entry/exit person trackers retain their camera-local IDs and
+also submit `TrackObservation` updates to `backend/cross_camera_tracking.py`.
+Observations are grouped into bounded tracklets. A tracklet is closed after a
+configurable inactivity gap; camera transitions then gate candidates by
+elapsed time and optional source/destination zones. Entry/exit processors
+provide their configured `entry` and `exit` zones. The API exposes transition
+rules at `GET`/`PUT /api/camera-transitions` and current candidate associations
+at `GET /api/cross-camera/candidates`.
+
+Re-ID is an optional asynchronous path with **OSNet-AIN x1.0 through
+Torchreid** as the proposed first baseline. `backend/reid/torchreid_osnet.py`
+implements the provider contract with 256 x 128 RGB preprocessing and
+normalized float32 embeddings. The checkpoint is a separately reviewed local
+artifact; no weights are bundled. Enablement is off by default and requires an
+explicit enable flag, approved plant validation dataset, and threshold derived
+from that validation. Quality-gated crops enter a bounded queue, and overloaded
+queues drop samples rather than stalling YOLO. See
+`models/reid/osnet_ain_x1_0/MODEL_CARD.md` for artifact review and validation
+steps. Candidate scores are uncalibrated ranking values (cosine similarity
+when embeddings are available, otherwise temporal fit), not identity
+probabilities; no fixed appearance/time blend is treated as a production score.
+
+Topology and appearance results are **candidate associations**, not confirmed
+identities. An authenticated operator can confirm a candidate through
+`POST /api/cross-camera/candidates/{candidate_id}/confirm`, optionally attaching
+it to an existing global track. Confirmation persists a `global_tracks` record
+and the two observed `global_track_segments` in SQLite. The local IDs remain
+unchanged. `GET /api/cross-camera/global-tracks` returns segments and advances
+persisted status through `active`, `temporarily_lost`, and `closed` using the
+configured identity timeout. Candidate state and Re-ID embeddings remain
+process-local; durable embeddings and automatic identity confirmation are not
+implemented.
+
 ### 5.3 OWLv2 path
 
 ```mermaid
@@ -288,6 +328,10 @@ The scheduler is a load-shedding boundary. It deliberately drops stale frames wh
 | --- | --- | --- |
 | `backend/analytics_runtime.py` | `ModelRegistry`, `InferenceEngine`, `get_inference_engine` | Shared YOLO model cache, locks, batching, callback dispatch |
 | `backend/analytics_runtime.py` | `HeadCountProcessor`, `EntryExitProcessor`, `FlapGateProcessor` | Tracking and zone state machines |
+| `backend/cross_camera_tracking.py` | `TrackObservation`, `Tracklet`, `CameraTransition`, `CrossCameraTracker` | Bounded tracklet association with configurable topology/time gates; candidate IDs only |
+| `backend/cross_camera_tracking.py` | `ReIDProvider`, `BoundedReIDWorker`, `configure_reid_provider` | Optional sampled-crop embedding worker; disabled until an approved provider is injected |
+| `backend/reid/torchreid_osnet.py` | `OSNetAINProvider` | OSNet-AIN x1.0 feature extraction from a reviewed local Re-ID checkpoint |
+| `backend/reid/validation.py` | `evaluate_labeled_pairs`, `select_threshold` | Plant-labeled positive/negative pair metrics and false-match-constrained threshold selection |
 | `backend/analytics_runtime.py` | `PPEDetectionProcessor`, `FireSmokeDetectionProcessor` | PPE and fire/smoke business rules |
 | `backend/anpr_processor.py` | ANPR processor | Vehicle, plate, OCR, and speed pipeline |
 | `backend/workforce_processor.py` | Workforce processor | Person/machine zone dwell and away alerts |
@@ -338,8 +382,8 @@ flowchart TB
 
 ### Durable versus ephemeral state
 
-- Durable: camera definitions, detection configurations, zone polygons, schedules, users, engineers, alerts, and SMTP settings in SQLite.
-- Ephemeral: decoded frames, publisher JPEG buffers, active processors, model objects, scheduler queues, tracker state, and thread health.
+- Durable: camera definitions and transitions, confirmed global tracks and their segments, detection configurations, zone polygons, schedules, users, engineers, alerts, and SMTP settings in SQLite.
+- Ephemeral: decoded frames, publisher JPEG buffers, active processors, model objects, scheduler queues, local/cross-camera tracklet state, candidate associations, Re-ID embeddings, and thread health.
 - Evidence: alert snapshots are stored under the configured alerts directory and referenced by alert records.
 - Configuration portability: camera paths are remapped by filename under `VISION_VIDEOS_DIR`; model paths are resolved from `models/` and the repository root.
 
@@ -404,37 +448,97 @@ flowchart LR
 7. Persist alerts asynchronously after the inference result is produced.
 8. Restart unhealthy workers without restarting the control plane or all cameras.
 
+### Workload reduction before adding hardware
+
+1. Treat the three detection outcomes as output requirements, not three model
+    calls. Prefer one task-trained detector that emits the required classes and
+    attributes in one forward. Use separate models only where the accuracy
+    evaluation demonstrates that one model cannot meet the requirement.
+2. Run the inexpensive fixed detector across all cameras and keep tracking,
+    zone transitions, and cooldown logic between detector updates. Reserve
+    OWLv2 for cameras or events that need open-vocabulary labels; where product
+    behavior permits, trigger it on a slower cadence or selected regions of
+    interest rather than every frame from every camera.
+3. Use a camera substream for analytics (initial target: 640x360 or 1280x720) and
+    retain the main stream only for operator display or evidence. Validate that
+    small-object and PPE accuracy still passes at that resolution.
+4. Decode RTSP in a bounded ingest service, use hardware video decode where
+    available, and keep one latest frame per camera/task. Do not transfer full
+    frame histories through the broker. Keep inference batch sizes bounded and
+    prioritize safety events over exploratory prompts.
+5. Convert fixed YOLO models to a supported accelerated runtime (for example,
+    TensorRT FP16) only after checking output parity on the labeled set. Share
+    one model instance per worker and batch compatible cameras; do not create a
+    model replica per camera.
+
+These are target deployment choices, not all implemented in the current
+single-process app. Resolution, cadence, event gating, and model choice must
+remain explicit workload settings and be measured against the same accuracy
+and alert-latency criteria.
+
 ## 9. Hardware Sizing Assumptions
 
 The following is a starting configuration, not a certification claim. Final sizing requires measurement with the exact camera resolutions, model weights, labels, alert rate, and target FPS.
 
-### Target hardware tier (not yet validated)
+### Probable hardware tiers (planning estimates, not validated)
 
-- 8 to 12 CPU cores.
-- 32 GB RAM.
-- One NVIDIA GPU with 8 GB VRAM.
-- NVMe sized for the agreed evidence-retention period and camera bitrate.
-- Separate API/control-plane process and GPU worker processes.
-- PostgreSQL is recommended for multi-process state; SQLite is a pilot option.
+The earlier 8 GB VRAM / 8-12 core / 32 GB proposal is a lower-cost validation
+point, not a comfortable 50-camera specification. The available M4 tests are
+not CUDA sizing results: 30 cloned readers used 6.89 GB RSS, while a 30-camera
+single-YOLO run completed only 1.52 forwards/sec against a 2 FPS-per-camera
+request cadence. They show that the existing all-in-one profile needs workload
+reduction and do not establish target GPU capacity.
+
+| Tier | Workload assumption | Probable host starting point |
+| --- | --- | --- |
+| Optimized lower-cost deployment | One consolidated YOLO-family task per camera at 0.5-1 inference/sec; OWLv2/YOLO-World only for selected cameras or sparse events | 12-16 modern CPU cores, 32-64 GB RAM, one NVIDIA GPU with 16 GB VRAM, NVMe, hardware video decode |
+| Comfortable 50-camera mixed deployment | Consolidated fixed detection plus moderate open-vocabulary use; selected model sustains the measured aggregate rate with at least 30% spare capacity | 16 CPU cores, 64 GB RAM, one 24 GB NVIDIA GPU as the first candidate; use two GPU workers if measured throughput or model coexistence does not leave the reserve |
+| Full independent-model deployment | Two fixed YOLO forwards plus Autotrack on every camera at 0.5-1 inference/sec per task | Plan for multiple GPU workers, initially two 16-24 GB GPUs; final count is determined by measured per-model service time and VRAM, not camera count alone |
+
+For any tier, separate the API from inference, use bounded ingest/inference
+queues, and use PostgreSQL if multiple processes write shared state. Size the
+network and evidence store from actual camera bitrate and retention; the
+application does not by itself require continuous video recording.
+
+The most probable comfortable starting specification for the optimized 50
+camera workload is therefore **16 CPU cores, 64 GB RAM, and one 24 GB NVIDIA
+GPU**. A single 16 GB GPU is a cost-down candidate when inference is consolidated
+and open-vocabulary work is sparse. Neither is a capacity claim until the
+selected models pass the full target replay and soak test.
 
 ### Calculation assumptions
 
 - 50 cameras at the resolutions and bitrates measured in Phase 1.
 - Display streaming is sampled independently from AI inference.
-- Fixed YOLO models run at approximately 2 to 10 FPS depending on use case and risk tier.
+- Detection cadence is specified per camera and per model. Use 0.5-1 inference/sec per consolidated task as the initial sizing case; higher rates require measured evidence.
 - Autotrack uses one selected open-vocabulary model (OWLv2 or YOLO-World).
 - Three required detection outcomes per camera do not imply three full-rate forwards; compatible prompts should share a forward where the selected model supports it.
-- Model replicas are sharded across GPUs; one global process lock is not used across the deployment.
+- Model replicas are sharded across GPUs; one global process lock is not used across the deployment. OWLv2 throughput must be measured separately from YOLO throughput.
 - Camera decoding, JPEG streaming, inference, alert persistence, and notifications have separate resource budgets.
 
-The previous local measurement on an Apple M4 showed approximately 0.73 OWLv2 FPS for one model replica and 1.37 seconds p50 latency. That result demonstrates why three full-rate models for every camera cannot be projected from one desktop process. GPU worker count must be selected from measured model throughput and the permitted sampling rate:
+At 50 cameras, one consolidated task at 0.5-1 inference/sec requires 25-50
+completed inferences/sec. Three independent tasks at the same cadence require
+75-150 completed inferences/sec. With 30% capacity reserve, the corresponding
+planning capacities are about 33-65 and 98-195 inferences/sec. These totals
+are workload arithmetic, not a claim that different models have equal cost.
+
+The previous local measurement on an Apple M4 showed approximately 0.73 OWLv2
+FPS for one model replica. The 2026-09-30 local MPS rehearsal also showed that
+the 30-camera, one-YOLO-task run achieved only 1.52 forwards/sec in aggregate
+at its configured 2 FPS per-camera request rate. Neither result transfers
+directly to CUDA. GPU worker count must be selected from sustained target-device
+throughput and the permitted sampling rate:
 
 ```text
-required_model_capacity = sum(camera_task_target_fps)
+required_model_capacity = 1.3 * sum(camera_task_target_fps)
 worker_count >= required_model_capacity / measured_replica_fps
 ```
 
-Add at least 30 percent headroom for burst load, preprocessing, post-processing, and model warm-up.
+The 1.3 multiplier reserves 30 percent for burst load, preprocessing,
+post-processing, and model warm-up. Measure each model/configuration with the
+production image size, batch size, precision, labels, and concurrent ingest;
+report p95 latency, per-camera completion, queue age, VRAM peak, and thermal
+steady state. A short benchmark peak is not a comfortable operating rate.
 
 ## 10. Observability Contract
 
@@ -457,6 +561,8 @@ Every ingest and inference worker should expose the following metrics. The curre
 The current process exposes scheduler `workers`, `active_cameras`,
 `queued_cameras`, `submitted`, `completed`, `dropped`, `errors`, and
 `completion_ratio` through the existing health and system-stat endpoints.
+The optional Re-ID worker exposes `queue_depth`, `submitted`, `completed`,
+`dropped`, and `errors` at `GET /api/cross-camera/reid-stats`.
 
 `backend/inference_protocol.py` defines the common `InferenceRequest` and
 `InferenceResult` contracts. `group_compatible_requests` groups OWLv2 requests
@@ -477,12 +583,15 @@ The current scheduler is a significant control-plane improvement, but the follow
 6. RTSP ingest, reconnect policy, network jitter handling, and camera health persistence require a production ingest worker.
 7. SQLite is not the preferred durable store for multiple inference processes writing alerts concurrently.
 8. GPU utilization, end-to-end alert latency, and per-camera SLOs still need to be measured on the proposed NVIDIA hardware.
+9. Cross-camera tracklets and candidates are process-local; confirmed global identity segments are durable, but multi-process association coordination is not implemented.
+10. Re-ID is pluggable but disabled by default. Approved weights, labeled identity validation, candidate-review UI, and multi-worker embedding transport remain deployment/product work.
+11. OSNet-AIN x1.0 is the proposed baseline only. No checkpoint is included or approved; its exact artifact license and plant-specific validation report must be reviewed before enabling the provider.
 
 Recommended implementation order, aligned with `VMS_SCALING_ROADMAP.md`:
 
 1. Complete Phase 1 ingest and single-detector measurements on the Windows validation machine.
 2. Evaluate OWLv2 and YOLO-World against the same attribute prompt set and labeled validation data; select one Autotrack model.
-3. Validate the chosen workload at 50 cameras on the target 8 GB VRAM / 8-12 core / 32 GB box.
+3. Validate the optimized workload at 50 cameras on the proposed 16-core / 64 GB / 24 GB GPU starting host; retain the 8 GB box as a lower-cost comparison, not an assumed pass target.
 4. Add or harden process supervision, bounded frame transport, and worker isolation only where Phase 1-3 measurements show the current process topology is the limiting factor.
 5. Complete the full-load soak and handover deliverables.
 
@@ -492,7 +601,7 @@ Recommended implementation order, aligned with `VMS_SCALING_ROADMAP.md`:
 | --- | --- |
 | Updated source and architecture changes | Shared latest-frame OWLv2 scheduler and processor integrations are implemented |
 | Camera/model process model | Current single-process model documented; target GPU-sharded model specified |
-| Hardware recommendation | One 8 GB VRAM GPU, 8-12 CPU cores, 32 GB RAM target; not yet validated |
+| Hardware recommendation | Optimized-workload planning point: 16 CPU cores, 64 GB RAM, one 24 GB GPU; still requires full CUDA validation. Lower-cost 16 GB GPU and multi-GPU full-load tiers are documented in Section 9. |
 | Performance results | Local M4 baseline and scheduler stress results documented in `README.md` |
 | Remaining bottlenecks | Serialized OWLv2, process-local scheduler, SQLite, RTSP and multi-GPU gaps documented above |
 | Preserve application purpose | Existing camera, zone, alert, scheduling, UI, YOLO, OWLv2, and engineer workflows retained |

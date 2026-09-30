@@ -145,6 +145,45 @@ def init_db():
             stats_json TEXT,
             created_at TEXT DEFAULT (datetime('now'))
         );
+        CREATE TABLE IF NOT EXISTS camera_transitions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            source_camera_id TEXT NOT NULL,
+            destination_camera_id TEXT NOT NULL,
+            min_transition_seconds REAL NOT NULL DEFAULT 0,
+            max_transition_seconds REAL NOT NULL,
+            source_zone_id TEXT,
+            destination_zone_id TEXT,
+            enabled INTEGER NOT NULL DEFAULT 1
+        );
+        CREATE TABLE IF NOT EXISTS global_tracks (
+            global_track_id TEXT PRIMARY KEY,
+            class_id TEXT NOT NULL DEFAULT 'person',
+            first_seen REAL NOT NULL,
+            last_seen REAL NOT NULL,
+            current_camera_id TEXT,
+            status TEXT NOT NULL DEFAULT 'active',
+            created_at TEXT DEFAULT (datetime('now'))
+        );
+        CREATE TABLE IF NOT EXISTS global_track_segments (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            global_track_id TEXT NOT NULL,
+            camera_id TEXT NOT NULL,
+            tracker_source TEXT NOT NULL,
+            local_track_id TEXT NOT NULL,
+            start_time REAL NOT NULL,
+            end_time REAL NOT NULL,
+            entry_zone TEXT,
+            exit_zone TEXT,
+            match_confidence REAL NOT NULL,
+            candidate_id TEXT NOT NULL,
+            created_at TEXT DEFAULT (datetime('now')),
+            UNIQUE(global_track_id, camera_id, tracker_source, local_track_id, start_time)
+        );
+        CREATE TABLE IF NOT EXISTS global_candidate_confirmations (
+            candidate_id TEXT PRIMARY KEY,
+            global_track_id TEXT NOT NULL,
+            confirmed_at TEXT DEFAULT (datetime('now'))
+        );
         CREATE TABLE IF NOT EXISTS automode_settings (
             id INTEGER PRIMARY KEY,
             enabled INTEGER DEFAULT 0,
